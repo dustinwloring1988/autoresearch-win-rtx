@@ -18,9 +18,30 @@ To set up a new experiment, work with the user to:
 
 Once you get confirmation, kick off the experimentation.
 
+## Startup: Create Daily Working Branch
+
+At the very start of the session, create a **daily working branch** for the entire night:
+
+```bash
+git checkout master
+git pull origin master
+git checkout -b daily/YYYY-MM-DD
+git push -u origin daily/YYYY-MM-DD
+```
+
+Example (for March 14, 2026):
+```bash
+git checkout master
+git pull origin master
+git checkout -b daily/2026-03-14
+git push -u origin daily/2026-03-14
+```
+
+All experiment work during this session occurs on this daily branch. The branch format must be `daily/YYYY-MM-DD`.
+
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 15 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
@@ -30,7 +51,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 15 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
 **VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
 
@@ -45,23 +66,79 @@ Once the script finishes it prints a summary like this:
 ```
 ---
 val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
+training_seconds: 900.1
+total_seconds:    925.9
 peak_vram_mb:     45060.2
 mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
+total_tokens_M:   1498.6
+num_steps:        2859
 num_params_M:     50.3
 depth:            8
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+Note that the script is configured to always stop after 15 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
 grep "^val_bpb:" run.log
 ```
 
-## Logging results
+## Experiment Documentation System
+
+After every experiment, you **MUST** create a new markdown file in the `reads/` folder.
+
+### Filename Format
+
+```
+reads/YYYY-MM-DD_HH-MM_experiment.md
+```
+
+Example:
+```
+reads/2026-03-14_14-30_increase_lr.md
+```
+
+### File Content Template
+
+Each experiment summary file must contain:
+
+```markdown
+# Experiment Summary
+
+## Hypothesis
+What change was being tested and why.
+
+## Change Made
+Exact code modification or idea attempted.
+
+## Result
+Metrics from the run (loss, val_bpb, etc).
+
+## Expected?
+Did the result match expectations? Why or why not?
+
+## Decision
+- Keep
+- Reject
+- Needs follow-up
+```
+
+### Critical: Read Previous Experiments
+
+Before proposing any new experiment, you **MUST** read previous experiment files in `reads/`. This allows you to:
+- Avoid repeating failed ideas
+- Build on successful approaches
+- Learn from previous decisions
+
+The experiment workflow is:
+1. Read `reads/*` summaries
+2. Decide next hypothesis based on past results
+3. Modify code
+4. Run experiment (15 minutes)
+5. Record result in `reads/`
+6. Commit changes
+7. Push to daily branch
+
+## Logging Results
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
@@ -87,28 +164,67 @@ c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
 d4e5f6g	0.000000	0.0	crash	double model width (OOM)
 ```
 
-## The experiment loop
+## The Experiment Loop
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+The experiment runs on the daily branch (e.g. `daily/2026-03-14`).
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. **Read** previous experiments: read files in `reads/`
+2. **Decide** next hypothesis based on past results
+3. **Modify** `train.py` with your experimental idea
+4. **Commit** changes: `git add . && git commit -m "experiment: <description>"`
+5. **Run** the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+6. **Record** results: create new file in `reads/` with experiment summary
+7. **Log** results to `results.tsv`
+8. **Push** to daily branch: `git push`
+9. **Evaluate**: If val_bpb improved (lower), you "advance" the branch, keeping the git commit. If val_bpb is equal or worse, you git reset back to where you started.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take ~15 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 25 minutes, kill it and treat it as a failure (discard and revert).
+
+**Command Timeout Safety**: Never use a command timeout shorter than 25 minutes (1500 seconds). This ensures experiments and training runs are not prematurely killed.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
 
+**ALWAYS Commit Reads Folder**: The `reads/` folder is critical. Every experiment must generate a new log file in this folder. Even if the experiment fails, the log must still be committed. This ensures GitHub keeps a complete research history.
+
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+As an example use case, a user might leave you running while they sleep. If each experiment takes you ~15 minutes then you can run approx 4/hour, for a total of about 32 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+
+## Nightly Merge to Master
+
+At the **end of the nightly session**, merge the daily branch into the real `master`:
+
+```bash
+git checkout master
+git pull origin master
+git merge daily/YYYY-MM-DD
+git push origin master
+```
+
+This ensures the master branch is only modified once per night.
+
+## Summary of Workflow
+
+### Startup:
+1. Checkout master and pull latest
+2. Create daily branch: `git checkout -b daily/YYYY-MM-DD`
+3. Push to remote: `git push -u origin daily/YYYY-MM-DD`
+
+### Loop:
+1. Read `reads/*` to learn from past experiments
+2. Decide next hypothesis
+3. Modify `train.py`
+4. Commit: `git add . && git commit -m "experiment: <description>"`
+5. Run experiment (15 minutes): `uv run train.py > run.log 2>&1`
+6. Record results in `reads/YYYY-MM-DD_HH-MM_experiment.md`
+7. Log to `results.tsv`
+8. Push: `git push`
+
+### Shutdown:
+1. Merge to master: `git checkout master && git merge daily/YYYY-MM-DD && git push origin master`
+
+(End of file - total 219 lines)
