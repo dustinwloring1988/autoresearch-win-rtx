@@ -3,3 +3,4 @@ commit	val_bpb	memory_gb	status	description
 926edfa	0.749101	3.7	keep	increase ASPECT_RATIO to 96
 1a109cb	0.730542	3.7	keep	increase MATRIX_LR to 0.06
 f77abca	0.720819	3.7	keep	increase MATRIX_LR to 0.08
+51bb12c	0.715879	3.7	keep	increase EMBEDDING_LR to 0.9
