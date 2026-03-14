@@ -4,3 +4,4 @@ commit	val_bpb	memory_gb	status	description
 1a109cb	0.730542	3.7	keep	increase MATRIX_LR to 0.06
 f77abca	0.720819	3.7	keep	increase MATRIX_LR to 0.08
 51bb12c	0.715879	3.7	keep	increase EMBEDDING_LR to 0.9
+1616b4c	0.715657	3.7	keep	increase SCALAR_LR to 1.0
