@@ -39,6 +39,15 @@ git push -u origin daily/2026-03-14
 
 All experiment work during this session occurs on this daily branch. The branch format must be `daily/YYYY-MM-DD`.
 
+## Data Folders
+
+This project uses two folders for experiment tracking:
+
+- **`reads/`** — Experiment summaries (hypothesis, changes, results, decisions)
+- **`runs/`** — Raw run logs from each experiment
+
+Both folders must be committed to the daily branch after each experiment.
+
 ## Experimentation
 
 Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 15 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
@@ -84,7 +93,9 @@ grep "^val_bpb:" run.log
 
 ## Experiment Documentation System
 
-After every experiment, you **MUST** create a new markdown file in the `reads/` folder.
+After every experiment, you **MUST**:
+1. Create a new markdown file in the `reads/` folder
+2. Save the run log to the `runs/` folder
 
 ### Filename Format
 
@@ -120,6 +131,9 @@ Did the result match expectations? Why or why not?
 - Keep
 - Reject
 - Needs follow-up
+
+## Run Log
+Link to the run log in `runs/` folder.
 ```
 
 ### Critical: Read Previous Experiments
@@ -133,10 +147,12 @@ The experiment workflow is:
 1. Read `reads/*` summaries
 2. Decide next hypothesis based on past results
 3. Modify code
-4. Run experiment (15 minutes)
-5. Record result in `reads/`
-6. Commit changes
-7. Push to daily branch
+4. Run experiment (15 minutes): `uv run train.py > run.log 2>&1`
+5. Save run log to `runs/YYYY-MM-DD_HH-MM_run.log`
+6. Record result in `reads/`
+7. Log results to `results.tsv`
+8. Commit changes
+9. Push to daily branch
 
 ## Logging Results
 
@@ -175,10 +191,11 @@ LOOP FOREVER:
 3. **Modify** `train.py` with your experimental idea
 4. **Commit** changes: `git add . && git commit -m "experiment: <description>"`
 5. **Run** the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-6. **Record** results: create new file in `reads/` with experiment summary
-7. **Log** results to `results.tsv`
-8. **Push** to daily branch: `git push`
-9. **Evaluate**: If val_bpb improved (lower), you "advance" the branch, keeping the git commit. If val_bpb is equal or worse, you git reset back to where you started.
+6. **Save** run log to `runs/YYYY-MM-DD_HH-MM_run.log`
+7. **Record** results: create new file in `reads/` with experiment summary
+8. **Log** results to `results.tsv`
+9. **Push** to daily branch: `git push`
+10. **Evaluate**: If val_bpb improved (lower), you "advance" the branch, keeping the git commit. If val_bpb is equal or worse, you git reset back to where you started.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
