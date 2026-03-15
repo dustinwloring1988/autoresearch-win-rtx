@@ -7,3 +7,4 @@ f77abca	0.720819	3.7	keep	increase MATRIX_LR to 0.08
 1616b4c	0.715657	3.7	keep	increase SCALAR_LR to 1.0
 75c0313	0.685149	3.7	keep	increase UNEMBEDDING_LR to 0.008
 7847b95	0.673947	3.7	keep	reduce WARMDOWN_RATIO to 0.3
+5383aaf	0.670615	3.7	keep	reduce WARMDOWN_RATIO to 0.2
