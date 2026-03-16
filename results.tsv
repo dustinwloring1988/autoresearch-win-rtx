@@ -1,3 +1,4 @@
 commit	val_bpb	memory_gb	status	description
 6200642	0.852725	3.0	keep	baseline
 2f81478	0.796798	3.0	keep	reduce WARMDOWN_RATIO to 0.2
+259efff	0.722828	3.7	keep	increase ASPECT_RATIO to 96
