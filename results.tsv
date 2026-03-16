@@ -9,3 +9,4 @@ ebdcda3	0.694570	3.7	keep	increase EMBEDDING_LR to 0.9
 72f17b3	0.665410	3.7	keep	reduce WARMDOWN_RATIO to 0.1
 cc7b8c8	1.287100	3.7	discard	increase UNEMBEDDING_LR to 0.012 (unstable)
 8497eff	0.664243	3.7	keep	increase MATRIX_LR to 0.1
+6be43f5	0.663287	3.7	keep	reduce WARMDOWN_RATIO to 0.05
