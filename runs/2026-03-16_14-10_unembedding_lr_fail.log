@@ -1,0 +1,45 @@
+torch.compile disabled in this fork runtime path.
+Using PyTorch SDPA attention backend.
+GPU: NVIDIA GeForce RTX 4060 Ti
+GPU VRAM: 16.0 GB
+GPU CC: 8.9
+GPU profile: ada-10-15gb
+Consumer matrix support: yes
+TF32: enabled
+AMP dtype: torch.bfloat16
+Vocab size: 16,384
+Dataset: tinystories
+Muon compute dtype: torch.bfloat16 (matching AMP dtype)
+Using cached autotune candidate: batch_size=4, checkpointing=on.
+Attention backend: sdpa
+torch.compile: disabled
+Trying train candidate: batch_size=4, activation_checkpointing=enabled
+Model config: {'sequence_len': 2048, 'vocab_size': 16384, 'n_layer': 8, 'n_head': 6, 'n_kv_head': 6, 'n_embd': 768, 'window_pattern': 'SSSL', 'attention_backend': 'sdpa', 'use_activation_checkpointing': True, 'compute_dtype': torch.bfloat16}
+Parameter counts:
+  wte                     : 12,582,912
+  value_embeds            : 50,331,648
+  lm_head                 : 12,582,912
+  transformer_matrices    : 56,623,872
+  scalars                 : 16
+  total                   : 132,121,360
+Estimated FLOPs per token: 5.096125e+08
+Scaling AdamW LRs by 1/sqrt(768/768) = 1.000000
+Time budget: 900s
+Gradient accumulation steps: 64
+step 00000 (0.0%) | loss: 9.704794 | lrm: 1.00 | dt: 23121ms | tok/sec: 22,675 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00001 (0.0%) | loss: 8.690830 | lrm: 1.00 | dt: 23092ms | tok/sec: 22,704 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00002 (0.0%) | loss: 7.361584 | lrm: 1.00 | dt: 23142ms | tok/sec: 22,654 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00003 (0.0%) | loss: 6.596740 | lrm: 1.00 | dt: 23155ms | tok/sec: 22,642 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00004 (0.0%) | loss: 6.166012 | lrm: 1.00 | dt: 23142ms | tok/sec: 22,655 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00005 (0.0%) | loss: 5.844232 | lrm: 1.00 | dt: 23161ms | tok/sec: 22,636 | mfu: 13.0% | epoch: 1 | remaining: 900s    step 00006 (0.0%) | loss: 5.520518 | lrm: 1.00 | dt: 23154ms | tok/sec: 22,643 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00007 (0.0%) | loss: 5.252755 | lrm: 1.00 | dt: 23149ms | tok/sec: 22,648 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00008 (0.0%) | loss: 5.031726 | lrm: 1.00 | dt: 23150ms | tok/sec: 22,647 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00009 (0.0%) | loss: 4.860783 | lrm: 1.00 | dt: 23147ms | tok/sec: 22,650 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00010 (0.0%) | loss: 4.718321 | lrm: 1.00 | dt: 23152ms | tok/sec: 22,645 | mfu: 13.1% | epoch: 1 | remaining: 900s    step 00011 (0.0%) | loss: 4.592865 | lrm: 1.00 | dt: 1130086ms | tok/sec: 463 | mfu: 0.3% | epoch: 1 | remaining: 0s    
+Saved checkpoint_pre_eval.pt
+Eval completed with batch_size=4
+---
+val_bpb:          1.287100
+training_seconds: 1130.1
+total_seconds:    1654.7
+peak_vram_mb:     3725.6
+mfu_percent:      0.53
+total_tokens_M:   6.3
+num_steps:        12
+num_params_M:     132.1
+depth:            8
+dataset:          tinystories
+train_batch_size: 4
+eval_batch_size:  4
+activation_checkpointing: enabled

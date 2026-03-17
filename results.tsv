@@ -1,1 +1,12 @@
 commit	val_bpb	memory_gb	status	description
+6200642	0.852725	3.0	keep	baseline
+2f81478	0.796798	3.0	keep	reduce WARMDOWN_RATIO to 0.2
+259efff	0.722828	3.7	keep	increase ASPECT_RATIO to 96
+5ee09dc	0.704180	3.7	keep	increase MATRIX_LR to 0.06
+a782b7e	0.699694	3.7	keep	increase MATRIX_LR to 0.08
+ebdcda3	0.694570	3.7	keep	increase EMBEDDING_LR to 0.9
+462eb92	0.668315	3.7	keep	increase UNEMBEDDING_LR to 0.008
+72f17b3	0.665410	3.7	keep	reduce WARMDOWN_RATIO to 0.1
+cc7b8c8	1.287100	3.7	discard	increase UNEMBEDDING_LR to 0.012 (unstable)
+8497eff	0.664243	3.7	keep	increase MATRIX_LR to 0.1
+6be43f5	0.663287	3.7	keep	reduce WARMDOWN_RATIO to 0.05
