@@ -84,6 +84,7 @@ pyproject.toml  — dependencies
 - **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
 - **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
 - **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+- **SFT-ready tokenizer.** The tokenizer follows nanochat's GPT-4-style BPE split pattern and named chat/tool delimiters (`<|user_start|>`, `<|assistant_start|>`, etc.), with a 16,384-token vocabulary—half of nanochat's default 32,768. After upgrading an existing checkout, rerun `uv run prepare.py` to rebuild the cached tokenizer.
 
 ## Platform support
 
