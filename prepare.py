@@ -29,7 +29,7 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048          # context length
-TIME_BUDGET = 300           # training time budget in seconds (5 minutes)
+TIME_BUDGET = 600           # training time budget in seconds (10 minutes)
 EVAL_TOKENS = 40 * 524288   # number of tokens for validation eval
 # Half of nanochat's default 32K vocabulary. This includes the special tokens
 # below, so the BPE mergeable vocabulary is slightly smaller.
