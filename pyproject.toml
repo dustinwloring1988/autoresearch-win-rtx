@@ -5,7 +5,7 @@ description = "Autonomous pretraining research swarm"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "huggingface_hub>=0.33.0",
+    "huggingface_hub>=1.25.1",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
