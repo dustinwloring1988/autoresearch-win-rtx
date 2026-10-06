@@ -12,9 +12,11 @@ To set up a new experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
+   - `report.py` — publishes finished runs to the research workspace. Do not modify; call it.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+5. **Verify reporting credentials**: every run gets published to the research workspace at https://autoresearch.bolt.host by `report.py`. Confirm `.env` exists and holds a non-empty `AUTORESEARCH_API_KEY`. That file is gitignored: never commit it, never echo the value into a run log, a commit message, or your own output. If the file is missing or empty, stop and ask the human for the key (it is created in Settings → Models & keys on the site) before running any experiments.
+6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run. Note that experiment numbers 0-11 are already occupied by the sample rows that ship with the site, so this branch's first run is published as #12. `report.py` assigns the number itself — do not pass one unless an upload failed and you need to fill the gap.
+7. **Confirm and go**: Confirm setup looks good.
 
 Once you get confirmation, kick off the experimentation.
 
@@ -27,6 +29,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
+- Modify `report.py` or `results.tsv` by hand. Reporting is a scripted step, not a free-form one.
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 
@@ -61,31 +64,42 @@ Note that the script is configured to always stop after 5 minutes, so depending 
 grep "^val_bpb:" run.log
 ```
 
-## Logging results
+## Reporting results
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+`report.py` is the single place results are recorded. It reads `run.log`, publishes the run to the workspace site, attaches the run's files, and appends the row to `results.tsv`. Never hand-write `results.tsv` rows and never hand-assemble API calls.
 
-The TSV has a header row and 5 columns:
-
-```
-commit	val_bpb	memory_gb	status	description
-```
-
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
+Report **every** finished run, kept or discarded — a discarded run is a real result and belongs in the record:
 
 ```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+uv run python report.py --name "short attention window" --hypothesis "..." --status kept
+uv run python report.py --name "GeLU activation" --hypothesis "..." --status discarded
 ```
+
+- `--name` — short slug of what changed (max 240 chars).
+- `--hypothesis` — markdown: what you expect and why. This becomes experiment.md together with the committed diff of `train.py` and the full run configuration.
+- `--status` — `kept` or `discarded` (report.py writes `keep`/`discard` into the tsv; do not translate it yourself).
+- `--results "..."` — optional extra markdown for results.md (interpretation, follow-ups).
+
+What lands on the site for each run:
+
+| Field | Content |
+| --- | --- |
+| `metric` | `val_bpb` from the log, with the best val_bpb so far as `baseline_metric` |
+| `metric_label` / `metric_direction` | `Validation BPP` / `lower` |
+| `experiment_md` | hypothesis, committed diff, every header/config line of the run |
+| `results_md` | val_bpb, delta vs baseline, verdict, throughput and VRAM numbers |
+| `train_log` | the terminal output, with step lines thinned to 120 evenly spaced points |
+| `chart_data` | per-step training loss, thinned to 120 points |
+| `metadata` | batch sizes, depth, optimizer dtypes, GPU profile, model config, parameter counts |
+| files | `checkpoint_pre_eval.pt` as the model, the tokenizer files as the tokenizer, `run.log` as the log |
+
+The full, untrimmed log is attached as a file; the `train_log` field is the thinned, readable version for the site's terminal panel.
+
+**Crashes are not uploaded.** A run without `val_bpb` has no metric, and publishing a fake one would poison the leaderboard. Still call `report.py` for it (with no `--status`) — it records a `crash` row in `results.tsv` and exits non-zero.
+
+Use `--dry-run` to print the exact payload without uploading, and `--no-files` to publish metrics and notes without attaching the 200 MB checkpoint.
+
+If attachments are skipped with "no Supabase user token", the run is still published — see Workspace API notes below.
 
 ## The experiment loop
 
@@ -99,7 +113,12 @@ LOOP FOREVER:
 4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
 5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv
+7. Decide keep or discard against the best `val_bpb` in `results.tsv` (the local record of what has been published), then publish the run exactly once:
+   - improved or equal-and-simpler: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status kept`
+   - worse: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status discarded`
+   - crashed: `uv run python report.py --name "<slug>" --hypothesis "<what and why>"` (records the crash, uploads nothing)
+
+   **Report before you reset.** `report.py` captures the commit hash and its diff of `train.py`, so the experiment commit must still be HEAD when it runs.
 8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
 9. If val_bpb is equal or worse, you git reset back to where you started
 
@@ -107,8 +126,52 @@ The idea is that you are a completely autonomous researcher trying things out. I
 
 **Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, report the crash and move on.
+
+**Reporting failures are not experiment failures**: if `report.py` fails (network, 401, 5xx), the training result is still valid. Fix the reporting, then re-run `report.py` with the same arguments and the same `run.log` — do not retrain, and do not record the run twice. Check `results.tsv` before re-reporting so you neither duplicate a row nor skip a number.
 
 **NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+
+## Workspace API notes
+
+Everything below is already implemented in `report.py`. Read this section when reporting breaks, when you need to know why, or if you ever need to talk to the API directly. Do not bypass `report.py` for routine runs.
+
+**Endpoint** — `POST https://tjstztttrdyuwxzucheq.supabase.co/functions/v1/agent-api`, JSON body, action in the `action` field. Auth is `Authorization: Bearer <AUTORESEARCH_API_KEY>`.
+
+**Actions used** — `upload_run` only. The remaining actions are deliberately unused:
+
+- `search` and `index_documents` need a 384-dimension embedding vector and no embedding model is available offline (installing one is not allowed). Research memory is instead `results.tsv` plus the runs page on the site, so lean on those.
+- `create_key`, `list_keys`, `revoke_key`, `reroll_key` require a Supabase **sign-in** JWT, not the `ar_` agent key, and they manage credentials. Only the human does this, in Settings → Models & keys.
+
+**Limits** (enforced by the server, `report.py` stays under them):
+
+| Field | Limit |
+| --- | --- |
+| `name` | 240 chars |
+| `description` | 4000 chars |
+| `experiment_md`, `results_md`, `train_log` | 200000 chars each |
+| attached file | 2 GB each |
+
+**File attachments** — the agent API has no upload action. The site stores files in the Supabase `experiment-artifacts` bucket and records a row per file in `experiment_artifacts` (`experiment_id`, `kind` of `model`/`tokenizer`/`train_log`, `file_name`, `storage_path`, `mime_type`, `size_bytes`). That path requires a Supabase **user** token; the `ar_` agent key is rejected there with `Invalid Compact JWS`. So `.env` should also carry one of:
+
+- `AUTORESEARCH_SUPABASE_JWT` + `AUTORESEARCH_SUPABASE_REFRESH_TOKEN` (from Settings → Models & keys)
+- or `AUTORESEARCH_SUPABASE_EMAIL` + `AUTORESEARCH_SUPABASE_PASSWORD`, which `report.py` exchanges for a fresh token before attaching
+
+Access tokens expire after about an hour; `report.py` re-mints one from the refresh token or password without being asked, which is what lets an overnight loop keep attaching files. With none of these set, runs are still published — metrics, notes, and the thinned log — and only the file attachments are skipped with a note.
+
+**Storage cost** — `checkpoint_pre_eval.pt` is roughly 200 MB and is attached on every run by default. That is about 2 GB per 10 experiments. `--no-files` publishes a run without files if the human wants to conserve space.
+
+**Troubleshooting**
+
+| Symptom | Meaning |
+| --- | --- |
+| `401` from agent-api | `AUTORESEARCH_API_KEY` is missing, wrong, or revoked |
+| `400 A run name, metric, and integer experiment number are required` | the payload was malformed — a `report.py` bug, report it rather than working around it |
+| `no Supabase user token` | metrics and notes are published, files are not; the human needs to fill in the token fields |
+| `Invalid Compact JWS` during attach | the `ar_` key was used where a user JWT is required; check `.env` |
+| `Bucket not found` | storage misconfiguration on the site, not something the agent can fix |
+
+**Secrets discipline** — `.env` is gitignored. Never commit it, never print the key or token, never include them in `--hypothesis`/`--results` text, and never let them reach `run.log` (which is uploaded).
+

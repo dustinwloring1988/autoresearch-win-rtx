@@ -24,7 +24,10 @@ The repo is deliberately kept small and only really has a three files that matte
 
 - **`prepare.py`** — fixed constants, one-time data prep (downloads TinyStories data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation).
 - **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
+- **`report.py`** — publishes each finished run to the research workspace at [autoresearch.bolt.host](https://autoresearch.bolt.host): metrics, notes, the terminal log, and the run's model/tokenizer files. **Called by the agent after every run, not edited.**
 - **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+
+Report credentials live in a gitignored `.env` (an agent API key, plus a Supabase user token if you want file attachments).
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
@@ -75,8 +78,10 @@ The `program.md` file is essentially a super lightweight "skill".
 ```
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
+report.py       — publishes a finished run to the workspace (agent runs this)
 program.md      — agent instructions
 pyproject.toml  — dependencies
+.env            — workspace credentials (gitignored)
 ```
 
 ## Design choices

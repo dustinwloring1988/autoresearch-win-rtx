@@ -16,5 +16,8 @@ queue/
 CLAUDE.md
 AGENTS.md
 
+# Workspace credentials (never commit)
+.env
+
 # Experimental code/artifacts
 dev/
