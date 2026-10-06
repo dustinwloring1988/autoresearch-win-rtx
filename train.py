@@ -6,6 +6,7 @@ Usage: uv run train.py
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import platform
@@ -145,7 +146,7 @@ def _resolve_gpu_profile(gpu_name, capability, gpu_vram_gb, is_windows):
                 default_checkpointing=True,
                 eval_batch_cap=4,
             )
-        if gpu_vram_gb < 16.0:
+        if gpu_vram_gb < (16.0 - VRAM_FLOOR_TOLERANCE_GB):
             mid_tier_name = f"{arch}-12-15gb" if arch == "turing" else f"{arch}-10-15gb"
             return GpuProfile(
                 name=mid_tier_name,
@@ -233,8 +234,14 @@ def _save_autotune_entries(path, entries):
         print(f"Warning: could not write autotune cache ({exc}).")
 
 
-def _make_autotune_cache_key(runtime):
+def _make_autotune_cache_key(runtime, vocab_size):
     cc = f"{runtime.gpu_cc[0]}.{runtime.gpu_cc[1]}"
+    # The winning batch size depends on the model geometry, not just the GPU: a
+    # narrower or shallower model fits a much larger micro-batch. Key on the
+    # resolved config so an architecture change re-probes instead of inheriting a
+    # stale decision (and leaving VRAM idle).
+    config = build_model_config(DEPTH, vocab_size, runtime, use_activation_checkpointing=False)
+    geometry = repr(asdict(config))
     return "|".join(
         [
             runtime.gpu_name,
@@ -243,6 +250,8 @@ def _make_autotune_cache_key(runtime):
             torch.__version__,
             platform.system(),
             str(MAX_SEQ_LEN),
+            str(vocab_size),
+            hashlib.sha1(geometry.encode("utf-8")).hexdigest()[:12],
         ]
     )
 
@@ -963,7 +972,7 @@ def _autotune_train_candidate(runtime, tokenizer, vocab_size, train_candidates):
         return None
 
     cache_path = _get_autotune_cache_path()
-    cache_key = _make_autotune_cache_key(runtime)
+    cache_key = _make_autotune_cache_key(runtime, vocab_size)
     refresh_cache = os.environ.get("AUTORESEARCH_AUTOTUNE_REFRESH", "0") == "1"
     cache_entries = _load_autotune_entries(cache_path)
     if refresh_cache:
