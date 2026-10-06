@@ -102,9 +102,21 @@ Use `--dry-run` to print the exact payload without uploading, and `--no-files` t
 
 If attachments are skipped with "no Supabase user token", the run is still published — see Workspace API notes below.
 
-## Ideation: sub-agents propose the experiments
+## Ideation: sub-agents propose the experiments, pipelined against the GPU
 
-You do not come up with the next idea alone. Once a run is reported and you know what the current best is, spawn **two sub-agents in parallel** (Task tool, `general` subagent type) and let each propose one experiment. Divergence is the entire point, so the two briefs must be disjoint — the same brief twice produces the same idea twice.
+You do not come up with the next idea alone, and you never do it while the GPU is idle. A run occupies the card for roughly 10 minutes of wall clock (autotune probing, then the 300 s training budget, then eval). That is exactly the window in which the next round's research happens.
+
+**The pipeline: launch the run first, then spawn the sub-agents while it trains.**
+
+1. You have a pair of ready ideas in hand (from the previous round).
+2. You pick one, edit `train.py`, commit, and **launch training in the background**.
+3. **In the same turn, spawn the two research sub-agents for the *next* round.** Two Task calls in one message, so they run concurrently with the training.
+4. Training finishes. You read the result, report it, keep or revert.
+5. The next round's proposals are already waiting. Pick one and launch immediately — no dead time on the card.
+
+So at every moment there is one run training and one round of ideas in the air. Never let the GPU wait on a sub-agent, and never let a sub-agent's web search happen while the card is idle waiting for you.
+
+Each round spawns **two sub-agents in parallel** (Task tool, `general` subagent type), each returning one experiment. Divergence is the entire point, so the two briefs must be disjoint — the same brief twice produces the same idea twice.
 
 Rotate the briefs so consecutive rounds do not orbit the same subsystem. Assign one sub-agent the **next domain in the rotation** and the other the domain after it:
 
@@ -115,51 +127,115 @@ Rotate the briefs so consecutive rounds do not orbit the same subsystem. Assign 
 | 3 | tokenizer-free efficiency: batch size, grad accumulation, activation checkpointing, fused paths | loss function, auxiliary objectives, value embeddings, prediction heads |
 | 4 | anything left, re-weighted by what results.tsv has not covered yet | the domain with the largest unexplained gap |
 
+Give each sub-agent the **measured regime from `ideas.md`**, not just the task. A proposal that ignores what this box has actually measured (step count, throughput, VRAM, which theses were refuted) is a wasted run. Also tell it which rotation domains the *other* agent owns, so the two cannot collide.
+
 Each sub-agent must:
 
 1. **Web-search recent arXiv work** (2025-2026 preferred) in ML/AI. Cite at least two papers by title and arXiv id, and state the concrete finding you are borrowing — not a vibe, a number or a mechanism.
-2. **Read `train.py`** to see what the code already does, and **read `results.tsv`** so it does not propose something already tried here.
-3. **Check the ledger in `ideas.md`** and not re-propose anything listed there.
-4. Return **exactly one** idea, small enough to be a focused diff in `train.py`, with:
+2. **Read `train.py`** to see what the code already does, and **read `results.tsv`** and **`ideas.md`** so it does not propose something already tried or already refuted here.
+3. Return **exactly one** idea, small enough to be a focused diff in `train.py`, with:
    - the paper(s) it comes from and the mechanism being borrowed,
    - the concrete edit: constants, functions, line references, and the new value,
    - the expected effect on `val_bpb` and roughly how big,
    - the risks: VRAM, wall-clock, numerical stability, likelihood of crashing,
    - a one-line fallback if it OOMs (the next smaller setting to try).
-5. Respect the hard constraints: `train.py` only, no new dependencies, no new data, `prepare.py` and `evaluate_bpb` untouched, must finish inside the 5-minute budget.
+4. Respect the hard constraints: `train.py` only, no new dependencies, no new data, `prepare.py` and `evaluate_bpb` untouched, must finish inside the 5-minute budget.
 
 Then **you pick one**. Choose on expected gain per unit of risk, sanity-check that it is not a near-duplicate of an earlier run, and write one sentence saying which you picked and why the other lost. Then implement only that one.
+
+**Keep the ready queue at one round deep.** Two pending ideas, no more. A deep backlog goes stale: the run in flight changes what looks promising, and a proposal written against the wrong baseline is worse than a fresh one. When you consume a round, spawn its replacement in the same turn as the launch.
 
 **Reuse beats re-ideating.** Keep the runner-up idea from the round. If the idea you picked crashes or is reverted, try the runner-up before paying for another round of sub-agents.
 
 **Ledger**: append one line per proposal to `ideas.md` — date, one-line name, source paper, and outcome (`pending` / `kept #N` / `discarded #N` / `crashed #N`). This is how an overnight loop avoids circling the same idea forever.
 
+## Running an experiment in the background
+
+Training blocks for about ten minutes, so launch it detached and get on with the ideation. Redirect all output — do NOT use `tee` or let it flood your context.
+
+PowerShell (this fork's platform):
+
+```powershell
+$env:UV_LINK_MODE='copy'   # hardlink fallback; harmless elsewhere
+Start-Process -FilePath 'cmd.exe' `
+  -ArgumentList '/c','uv run --frozen train.py > run.log 2>&1' `
+  -WorkingDirectory (Get-Location).Path -WindowStyle Hidden -PassThru
+```
+
+POSIX:
+
+```bash
+nohup uv run --frozen train.py > run.log 2>&1 &
+```
+
+Use `--frozen` so `uv` never rewrites `uv.lock` mid-loop. Nothing in this repo changes dependencies, so the committed lockfile is always the right one.
+
+**Do not poll the log for progress.** Python block-buffers stdout when it is redirected to a file, so `run.log` stays empty until the process exits — an empty log means "still running", not "crashed". Wait for the process to exit, then read the log once. A run takes roughly 10 minutes end to end (autotune probe + 300 s training + eval), so poll the process at ~60 s intervals rather than sleeping blindly for a fixed time.
+
 ## The experiment loop
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
 
+The loop is a pipeline, not a sequence. The two invariants:
+
+- **The GPU is never idle.** Every launch is immediately followed by the next round's ideation.
+- **You never wait on a sub-agent while the card is idle.** Ideation happens during training.
+
+```
+STARTUP (once): run the ideation stage yourself, with no run in flight.
+                Two sub-agents, two disjoint domains. Keep the better idea
+                as the first experiment and the other as the ready runner-up.
+
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on, and `results.tsv` for the best val_bpb so far
-2. Pick the next experiment: run the ideation stage above (two sub-agents, two disjoint domains) unless you still have an untried runner-up from the last round
-3. Tune `train.py` with that idea by directly hacking the code.
-4. git commit
-5. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-8. Decide keep or discard against the best `val_bpb` in `results.tsv` (the local record of what has been published), then publish the run exactly once:
-   - improved or equal-and-simpler: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status kept`
-   - worse: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status discarded`
-   - crashed: `uv run python report.py --name "<slug>" --hypothesis "<what and why>"` (records the crash, uploads nothing)
+ 1. Read the state: current branch/commit, `results.tsv` for the best val_bpb,
+    `ideas.md` for the ready queue.
+ 2. Pick the next experiment from the ready queue. If the queue is empty, run
+    the ideation stage now and accept the wait — this should only happen once,
+    at startup, or after a run crashed and both ideas were consumed.
+ 3. Write down your pick in one sentence: which idea, and why the other lost.
+ 4. Tune `train.py` with that idea by directly hacking the code, then git commit.
+ 5. LAUNCH the run in the background (see "Running an experiment in the
+    background" above). Note the process id and the start time.
+ 6. IN THE SAME TURN, spawn the two research sub-agents for the round after
+    this one — two Task calls in one message, briefs from the next rotation,
+    each carrying the measured regime from `ideas.md` and told which domain the
+    other agent owns. This is the step that keeps the card busy; do it before
+    anything else.
+ 7. Wait for the run to finish (poll the process, ~60 s apart; the log stays
+    empty until exit because Python block-buffers).
+ 8. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+ 9. If the grep output is empty, the run crashed. Read the last 50 lines of
+    run.log for the Python stack trace and attempt a fix. If you can't get
+    things to work after more than a few attempts, give up and take the
+    runner-up idea instead of paying for new ideation.
+10. Decide keep or discard against the best `val_bpb` in `results.tsv`, then
+    publish the run exactly once:
+    - improved or equal-and-simpler: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status kept`
+    - worse: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status discarded`
+    - crashed: `uv run python report.py --name "<slug>" --hypothesis "<what and why>"` (records the crash, uploads nothing)
 
-   **Report before you reset.** `report.py` captures the commit hash and its diff of `train.py`, so the experiment commit must still be HEAD when it runs.
-9. Mark the outcome of this idea in the `ideas.md` ledger with its run number, and **commit the ledger before any `git reset`** — the discard step below throws away uncommitted work
-10. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-11. If val_bpb is equal or worse, you git reset back to where you started
+    **Report before you reset.** `report.py` captures the commit hash and its diff of `train.py`, so the experiment commit must still be HEAD when it runs.
+11. Mark the outcome in the `ideas.md` ledger with its run number, and **commit the ledger before any `git reset`** — step 12 throws away uncommitted work
+12. If val_bpb improved (lower), you "advance" the branch, keeping the git commit. If equal or worse, `git reset` back to where you started.
+13. Go to step 1. The next round's proposals are already waiting, and the card is free.
+```
+
+Step 13 must not have a gap. The moment the run exits and is reported, the next experiment goes in — including when the result was a discard, and including when the sub-agents' proposals need ten minutes of your own reading before you commit to one.
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: the 5-minute budget applies to *training only*, and `training_seconds` in the summary should land near 300. Wall clock is much longer, and that is normal:
+
+| phase | wall clock |
+| --- | --- |
+| autotune probe (only when the model geometry changed) | up to ~7 min |
+| training | 300 s by design |
+| eval | ~4 min |
+| total, cached autotune decision | **~10 min** (measured: 581 s for #14) |
+| total, geometry changed so autotune re-probed | **~17 min** (measured: ~17 min for #15) |
+
+So do not kill a run at 10 minutes — that would kill most good ones. Kill only if wall clock passes ~25 minutes, or if `training_seconds` is wildly above 300 with no progress in the step lines. A run that OOMs or dies exits on its own long before that.
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, report the crash and move on.
 

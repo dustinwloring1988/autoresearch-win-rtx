@@ -26,6 +26,9 @@ Everything below is measured on this box, not assumed. Read it before proposing 
 - **~38 optimizer steps per 300 s run.** The loop is brutally short-horizon: any claim
   about "the run length" is a claim about 38 steps. #13 baseline 33 steps, #14 38,
   #15 45.
+- **Wall clock is ~10 min per run, ~17 min when the geometry changed** (autotune re-probe
+  ~7 min + 300 s training + ~4 min eval). Never kill a run at 10 minutes; ideation runs
+  concurrently with exactly this window, which is the whole point of the pipeline.
 - **Throughput, wide model (width 512, 50.3M):** 47,114 tok/s best (batch 4, activation
   checkpointing off). With checkpointing on the same batch gives 38,362 — **turning
   checkpointing off is worth ~26%**, far more than any batch size choice (46,102 at
