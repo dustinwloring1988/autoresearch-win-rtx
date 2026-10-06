@@ -265,10 +265,22 @@ Everything below is already implemented in `report.py`. Read this section when r
 | `experiment_md`, `results_md`, `train_log` | 200000 chars each |
 | attached file | 2 GB each |
 
-**File attachments** — the agent API has no upload action. The site stores files in the Supabase `experiment-artifacts` bucket and records a row per file in `experiment_artifacts` (`experiment_id`, `kind` of `model`/`tokenizer`/`train_log`, `file_name`, `storage_path`, `mime_type`, `size_bytes`). That path requires a Supabase **user** token; the `ar_` agent key is rejected there with `Invalid Compact JWS`. So `.env` should also carry one of:
+**File attachments** — the agent API has no upload action. The site stores files in the Supabase `experiment-artifacts` bucket and records a row per file in `experiment_artifacts` (`experiment_id`, `kind` of `model`/`tokenizer`/`train_log`, `file_name`, `storage_path`, `mime_type`, `size_bytes`).
 
-- `AUTORESEARCH_SUPABASE_JWT` + `AUTORESEARCH_SUPABASE_REFRESH_TOKEN` (from Settings → Models & keys)
-- or `AUTORESEARCH_SUPABASE_EMAIL` + `AUTORESEARCH_SUPABASE_PASSWORD`, which `report.py` exchanges for a fresh token before attaching
+Which credential works there, measured against this project:
+
+| Credential | Storage upload | Artifact row | Notes |
+| --- | --- | --- | --- |
+| `ar_…` agent key | no | no | not a JWT: `Invalid Compact JWS` |
+| anon / publishable key alone | **no** | yes | upload blocked by RLS: `new row violates row-level security policy`. The table insert passes RLS and fails only on the foreign key, so the storage write is the sole blocker. Reading is allowed. |
+| anon key + user JWT | yes | yes | what the site itself does |
+| `service_role` / `sb_secret_…` | yes | yes | bypasses RLS entirely, no user session needed |
+
+So `.env` needs one of:
+
+- `AUTORESEARCH_SUPABASE_JWT` + `AUTORESEARCH_SUPABASE_REFRESH_TOKEN` (from Settings → Models & keys) — the **preferred** route: it is a real user session, scoped like the site's own.
+- `AUTORESEARCH_SUPABASE_EMAIL` + `AUTORESEARCH_SUPABASE_PASSWORD`, which `report.py` exchanges for a fresh token before attaching.
+- or `AUTORESEARCH_SUPABASE_JWT` set to a `service_role` / `sb_secret_…` key, which works in the same slot because `report.py` sends whatever it is as both `apikey` and `Authorization`, and a non-JWT secret fails its expiry check harmlessly. Simplest and fully unattended, but it is a **project-wide RLS bypass**: anyone holding it can read and delete every table and every bucket. Keep it in `.env` only, never in a commit or in `--hypothesis`/`--results` text (both end up on the site), and rotate it if it ever leaks.
 
 Access tokens expire after about an hour; `report.py` re-mints one from the refresh token or password without being asked, which is what lets an overnight loop keep attaching files. With none of these set, runs are still published — metrics, notes, and the thinned log — and only the file attachments are skipped with a note.
 
