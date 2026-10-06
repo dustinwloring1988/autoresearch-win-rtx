@@ -805,8 +805,8 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64         # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128            # target head dimension for attention
+ASPECT_RATIO = 48         # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 96            # target head dimension for attention
 WINDOW_PATTERN = "SSSL"   # sliding window pattern: L=full, S=half context
 
 # Optimization
@@ -824,7 +824,7 @@ FINAL_LR_FRAC = 0.0
 # Model size + memory defaults
 DEPTH = 8
 DEVICE_BATCH_SIZE = 16
-EVAL_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 8      # pinned: the scored val subset must not move with the micro-batch
 
 
 def build_model_config(depth, vocab_size, runtime, use_activation_checkpointing=None):
