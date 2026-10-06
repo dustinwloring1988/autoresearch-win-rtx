@@ -15,7 +15,7 @@ To set up a new experiment, work with the user to:
    - `report.py` — publishes finished runs to the research workspace. Do not modify; call it.
    - `ideas.md` — the ledger of ideas already proposed and their outcomes. Append to it.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Verify reporting credentials**: every run gets published to the research workspace at https://autoresearch.bolt.host by `report.py`. Confirm `.env` exists and holds a non-empty `AUTORESEARCH_API_KEY`. That file is gitignored: never commit it, never echo the value into a run log, a commit message, or your own output. If the file is missing or empty, stop and ask the human for the key (it is created in Settings → Models & keys on the site) before running any experiments.
+5. **Verify reporting credentials**: every run gets published to the research workspace at https://autolabz.bolt.host by `report.py`. Confirm `.env` exists and holds a non-empty `AUTOLABZ_API_TOKEN` (an `ar_live_...` token from Settings → API) **and** a non-empty `SUPABASE_SECRET_KEY` — the published API cannot create experiments, so the reporter writes those tables directly. That file is gitignored: never commit it, never echo a value into a run log, a commit message, or your own output. If either value is missing, stop and ask the human before running any experiments.
 6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run. Note that experiment numbers 0-11 are already occupied by the sample rows that ship with the site, so this branch's first run is published as #12. `report.py` assigns the number itself — do not pass one unless an upload failed and you need to fill the gap.
 7. **Confirm and go**: Confirm setup looks good.
 
@@ -81,20 +81,18 @@ uv run python report.py --name "GeLU activation" --hypothesis "..." --status dis
 - `--status` — `kept` or `discarded` (report.py writes `keep`/`discard` into the tsv; do not translate it yourself).
 - `--results "..."` — optional extra markdown for results.md (interpretation, follow-ups).
 
-What lands on the site for each run:
+What lands on the site for each run (the field names are the workspace's, see the API notes below):
 
-| Field | Content |
+| Target | Content |
 | --- | --- |
-| `metric` | `val_bpb` from the log, with the best val_bpb so far as `baseline_metric` |
-| `metric_label` / `metric_direction` | `Validation BPP` / `lower` |
-| `experiment_md` | hypothesis, committed diff, every header/config line of the run |
-| `results_md` | val_bpb, delta vs baseline, verdict, throughput and VRAM numbers |
-| `train_log` | the terminal output, with step lines thinned to 120 evenly spaced points |
-| `chart_data` | per-step training loss, thinned to 120 points |
-| `metadata` | batch sizes, depth, optimizer dtypes, GPU profile, model config, parameter counts |
-| files | `checkpoint_pre_eval.pt` as the model, the tokenizer files as the tokenizer, `run.log` as the log |
+| `experiments` | `name`, `status`, `score` (the `val_bpb` from the log), `delta` against the previous best, `duration_seconds`, `experiment_number` |
+| `experiment.md` | hypothesis, committed diff of `train.py`, and every header/config line of the run |
+| `results.md` | val_bpb, delta, verdict, throughput and VRAM numbers |
+| `train.log` | the terminal output, with step lines thinned to 120 evenly spaced points |
+| `metric_points` | per-step `train_loss` and `smoothed_loss`, thinned to 120 points — this is the site's loss curve |
+| files | the tokenizer once per run, and `checkpoint_pre_eval.pt` when the experiment is kept (split into parts if it exceeds 50 MB) |
 
-The full, untrimmed log is attached as a file; the `train_log` field is the thinned, readable version for the site's terminal panel.
+The full run configuration has no dedicated column here, so it is preserved inside `experiment.md` rather than being dropped. The raw log is thinned for the `train.log` artifact because that panel is text; the untrimmed log is what the agent still has on disk in `run.log`.
 
 **Crashes are not uploaded.** A run without `val_bpb` has no metric, and publishing a fake one would poison the leaderboard. Still call `report.py` for it (with no `--status`) — it records a `crash` row in `results.tsv` and exits non-zero.
 
@@ -245,56 +243,84 @@ So do not kill a run at 10 minutes — that would kill most good ones. Kill only
 
 As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
 
+
 ## Workspace API notes
 
-Everything below is already implemented in `report.py`. Read this section when reporting breaks, when you need to know why, or if you ever need to talk to the API directly. Do not bypass `report.py` for routine runs.
+Everything below is already implemented in `report.py`. Read this when reporting breaks, when
+you need to know why, or if you ever need to talk to the API directly. Do not bypass
+`report.py` for routine runs.
 
-**Endpoint** — `POST https://tjstztttrdyuwxzucheq.supabase.co/functions/v1/agent-api`, JSON body, action in the `action` field. Auth is `Authorization: Bearer <AUTORESEARCH_API_KEY>`.
+**Site**: https://autolabz.bolt.host — Supabase project `rrvalubtixdiecurxpqa`.
 
-**Actions used** — `upload_run` only. The remaining actions are deliberately unused:
+**Published API** — `POST|GET {SUPABASE_URL}/functions/v1/api/...`, JSON, auth is
+`Authorization: Bearer <AUTOLABZ_API_TOKEN>` (an `ar_live_…` token from Settings → API).
 
-- `search` and `index_documents` need a 384-dimension embedding vector and no embedding model is available offline (installing one is not allowed). Research memory is instead `results.tsv` plus the runs page on the site, so lean on those.
-- `create_key`, `list_keys`, `revoke_key`, `reroll_key` require a Supabase **sign-in** JWT, not the `ar_` agent key, and they manage credentials. Only the human does this, in Settings → Models & keys.
-
-**Limits** (enforced by the server, `report.py` stays under them):
-
-| Field | Limit |
+| Route | Used for |
 | --- | --- |
-| `name` | 240 chars |
-| `description` | 4000 chars |
-| `experiment_md`, `results_md`, `train_log` | 200000 chars each |
-| attached file | 2 GB each |
+| `GET /runs` | find the existing run by name |
+| `POST /runs` | create the run: `{name, repo_url, baseline_score}` |
+| `GET /runs/:id/experiments` | verify what was published |
+| `GET /experiments/:id` | verify one experiment |
+| `GET /experiments/:id/metrics` | verify the loss curve |
+| `GET|POST /blogs` | not used by the loop |
 
-**File attachments** — the agent API has no upload action. The site stores files in the Supabase `experiment-artifacts` bucket and records a row per file in `experiment_artifacts` (`experiment_id`, `kind` of `model`/`tokenizer`/`train_log`, `file_name`, `storage_path`, `mime_type`, `size_bytes`).
+**The gap that shapes the design**: the published API cannot create experiments, metric
+points, artifacts or files. `POST /experiments` answers `400 Experiment ID is required` no
+matter what you send (body keys, query params and headers were all tried), and every other
+write route 404s. So `report.py` writes those four tables directly with
+`SUPABASE_SECRET_KEY`, which is a service credential that bypasses RLS. The `ar_live_` token
+still covers run creation and every read.
 
-Which credential works there, measured against this project:
+**What gets written where** (verified end to end against this project):
 
-| Credential | Storage upload | Artifact row | Notes |
-| --- | --- | --- | --- |
-| `ar_…` agent key | no | no | not a JWT: `Invalid Compact JWS` |
-| anon / publishable key alone | **no** | yes | upload blocked by RLS: `new row violates row-level security policy`. The table insert passes RLS and fails only on the foreign key, so the storage write is the sole blocker. Reading is allowed. |
-| anon key + user JWT | yes | yes | what the site itself does |
-| `service_role` / `sb_secret_…` | yes | yes | bypasses RLS entirely, no user session needed |
+| Target | Where | Fields |
+| --- | --- | --- |
+| experiment | `experiments` | `id` (client-generated uuid), `run_id`, `experiment_number` (from 1), `name`, `status` (`kept`/`discarded`), `score` (= val_bpb), `delta` (signed, negative is better), `duration_seconds` |
+| loss curve | `metric_points` | `experiment_id`, `step`, `train_loss`, `smoothed_loss` |
+| notes | `experiment_artifacts` | `artifact_type` is exactly one of `experiment.md`, `results.md`, `train.log`; `content` is the text |
+| files | `autoresearch-files` bucket + `run_files` | `run_id`, `file_kind` (`model`/`tokenizer` only), `file_name`, `storage_path`, `size_bytes`, `mime_type`, and `user_id` (NOT NULL — copy it from the run) |
+| run counters | `research_runs` | `total_experiments`, `kept_improvements`, `best_score`, `status` |
 
-So `.env` needs one of:
+`experiments` has no `metadata`, `chart_data` or `description` column: the per-run
+configuration is preserved inside `experiment.md`, and the curve lives in `metric_points`.
+`gradient_norm`, `learning_rate` and `eval_loss` exist on `metric_points` but the training
+log does not print them, so they are left null rather than filled with a different quantity.
 
-- `AUTORESEARCH_SUPABASE_JWT` + `AUTORESEARCH_SUPABASE_REFRESH_TOKEN` (from Settings → Models & keys) — the **preferred** route: it is a real user session, scoped like the site's own.
-- `AUTORESEARCH_SUPABASE_EMAIL` + `AUTORESEARCH_SUPABASE_PASSWORD`, which `report.py` exchanges for a fresh token before attaching.
-- or `AUTORESEARCH_SUPABASE_JWT` set to a `service_role` / `sb_secret_…` key, which works in the same slot because `report.py` sends whatever it is as both `apikey` and `Authorization`, and a non-JWT secret fails its expiry check harmlessly. Simplest and fully unattended, but it is a **project-wide RLS bypass**: anyone holding it can read and delete every table and every bucket. Keep it in `.env` only, never in a commit or in `--hypothesis`/`--results` text (both end up on the site), and rotate it if it ever leaks.
+**File policy** — files belong to the *run*, not to one experiment, so uploading on every
+experiment would duplicate the identical tokenizer. `report.py` uploads the tokenizer files
+once per run, and the checkpoint only when an experiment is kept. The tokenizer never
+changes during a run, so one copy is exact for every experiment.
 
-Access tokens expire after about an hour; `report.py` re-mints one from the refresh token or password without being asked, which is what lets an overnight loop keep attaching files. With none of these set, runs are still published — metrics, notes, and the thinned log — and only the file attachments are skipped with a note.
+**The 50 MB object cap is a plan limit, not a request limit.** The bucket allows 5 GiB, but
+a plain POST is refused above 50 MiB (48 MiB passes, 52 MiB gets `413 Payload too large`)
+and the TUS resumable endpoint refuses exactly the same sizes. `checkpoint_pre_eval.pt` is
+~96 MiB, so `report.py` splits anything above the cap into ordered parts named
+`NAME.part01-of-03`, `NAME.part02-of-03`, … which concatenate back byte for byte (verified
+by round-trip). `cat NAME.part* > NAME` restores the original. Only then is the `run_files`
+row written, and a failed row insert deletes the uploaded object so no orphans are left.
 
-**Storage cost** — `checkpoint_pre_eval.pt` is roughly 200 MB and is attached on every run by default. That is about 2 GB per 10 experiments. `--no-files` publishes a run without files if the human wants to conserve space.
+**Idempotence** — `ensure_run` reuses the run with the matching name instead of forking a
+new one, and `results.tsv` already carries the commit sha, so re-reporting the same run is
+a no-op rather than a duplicate experiment.
+
+**results.tsv** has six columns:
+
+```
+commit	val_bpb	memory_gb	status	description	experiment
+```
+
+The last column is the `experiment_number` published to the workspace. It exists because
+the workspace numbers experiments per run from 1, and a crash is recorded with an *empty*
+number (it is never published) — so counting rows would drift. `status` is `keep`,
+`discard` or `crash`; the agent passes `kept`/`discarded` to `report.py` and it translates.
 
 **Troubleshooting**
 
 | Symptom | Meaning |
 | --- | --- |
-| `401` from agent-api | `AUTORESEARCH_API_KEY` is missing, wrong, or revoked |
-| `400 A run name, metric, and integer experiment number are required` | the payload was malformed — a `report.py` bug, report it rather than working around it |
-| `no Supabase user token` | metrics and notes are published, files are not; the human needs to fill in the token fields |
-| `Invalid Compact JWS` during attach | the `ar_` key was used where a user JWT is required; check `.env` |
-| `Bucket not found` | storage misconfiguration on the site, not something the agent can fix |
-
-**Secrets discipline** — `.env` is gitignored. Never commit it, never print the key or token, never include them in `--hypothesis`/`--results` text, and never let them reach `run.log` (which is uploaded).
-
+| `401 Invalid or expired API token` | `AUTOLABZ_API_TOKEN` missing, wrong or revoked |
+| `403 Invalid Compact JWS` | the `ar_live_` token was used for a direct table write; that path needs `SUPABASE_SECRET_KEY` |
+| `Experiment ID is required` | the published API still cannot create experiments; that is expected, `report.py` writes the table directly |
+| `413 Payload too large` on upload | object over the 50 MB cap; `report.py` should have split it — if this appears anyway, the split path failed and the error names the part |
+| `null` in a `run_files` insert | `user_id` was not passed; it must match the run's owner |
+| `Bucket not found` | `.env` points at a different Supabase project than the site |

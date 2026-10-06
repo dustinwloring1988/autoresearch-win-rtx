@@ -1,26 +1,28 @@
-"""Publish a completed autoresearch run to the autoresearch workspace.
+"""Publish a completed autoresearch run to the autolabz workspace.
 
 Reads the terminal output of `uv run train.py` (run.log), extracts the summary
-block and the per-step loss curve, then uploads one experiment to the workspace
-site (https://autoresearch.bolt.host) and attaches the run's files (model
-checkpoint, tokenizer files, the raw log).
+block and the per-step loss curve, then publishes one experiment to the
+workspace site (https://autolabz.bolt.host) with its notes, log and loss
+curve, and attaches the run's model and tokenizer files.
 
 This script never edits train.py or prepare.py. It is run by the agent after
 every experiment:
 
     uv run python report.py --name "shorter attention window" --hypothesis "..."
 
-Credentials are read from the environment or from a gitignored .env file:
+Credentials, from the environment or a gitignored .env:
 
-    AUTORESEARCH_API_KEY              ar_... agent key   (upload_run)
-    AUTORESEARCH_SUPABASE_JWT         user access token  (file attachments)
-    AUTORESEARCH_SUPABASE_REFRESH_TOKEN  optional, mints a new access token
-    AUTORESEARCH_SUPABASE_EMAIL / _PASSWORD  optional, password grant instead
+    AUTOLABZ_API_TOKEN            ar_live_...   agent token (Settings -> API)
+    SUPABASE_URL                  project URL that serves the workspace
+    SUPABASE_SECRET_KEY           service/secret key, for direct table writes
 
-The agent key alone is enough to publish metrics, notes and the log. Binary
-attachments additionally require a Supabase *user* token because the agent API
-has no file-upload action; without one the run is still published and the
-attachments are reported as skipped.
+The published agent API (POST /runs, plus reads) is thin: it can create a run
+and blog posts, but there is no route for creating experiments, metric points,
+artifacts or files. Those live in Supabase tables that only accept a service
+credential, so experiments are written directly to `experiments`,
+`metric_points` and `experiment_artifacts`, and files go to the
+`autoresearch-files` bucket plus the `run_files` table. See program.md for the
+full field contract.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -42,32 +45,43 @@ from urllib.parse import urlparse
 
 import requests
 
-AGENT_API = "https://tjstztttrdyuwxzucheq.supabase.co/functions/v1/agent-api"
-DEFAULT_SUPABASE_URL = "https://tjstztttrdyuwxzucheq.supabase.co"
-STORAGE_BUCKET = "experiment-artifacts"
-ARTIFACT_TABLE = "experiment_artifacts"
+# Workspace API (Supabase edge function). Paths from the site's Agents tab.
+DEFAULT_SUPABASE_URL = "https://rrvalubtixdiecurxpqa.supabase.co"
+API_SUFFIX = "/functions/v1/api"
 
+# Direct table + storage access for what the API cannot write.
+STORAGE_BUCKET = "autoresearch-files"
+MAX_ARTIFACT_BYTES = 5 * 1024 * 1024 * 1024
 
-def project_ref(url):
-    """The Supabase project id inside a project URL (ref.supabase.co)."""
-    host = urlparse(url).hostname or ""
-    return host.split(".")[0]
+# Storage limits, measured against this project rather than assumed: a plain POST
+# is refused above 50 MiB (48 MiB passes, 52 MiB gets 413) and the TUS resumable
+# endpoint refuses the same sizes, so the ceiling is the project plan, not the
+# request path -- the bucket itself allows 5 GiB. Anything above the ceiling is
+# therefore split into ordered parts that concatenate back into the original.
+MAX_OBJECT_BYTES = 48 * 1024 * 1024
+PLAIN_UPLOAD_LIMIT = 48 * 1024 * 1024
+SPLIT_PART_BYTES = 40 * 1024 * 1024
+TUS_CHUNK = 6 * 1024 * 1024
+TUS_VERSION = "1.0.0"
 
+# artifact_type vocabulary, read by the site's per-experiment tabs.
+ARTIFACT_EXPERIMENT = "experiment.md"
+ARTIFACT_RESULTS = "results.md"
+ARTIFACT_TRAIN_LOG = "train.log"
+ARTIFACT_TYPES = (ARTIFACT_EXPERIMENT, ARTIFACT_RESULTS, ARTIFACT_TRAIN_LOG)
 
-# Attachments must land in the same project that serves the agent API, because
-# that is where the experiment row lives and experiment_artifacts has a foreign
-# key to it. A key from any other project cannot work.
-AGENT_PROJECT_REF = project_ref(AGENT_API)
+# file_kind vocabulary: the site only knows these two.
+FILE_KIND_MODEL = "model"
+FILE_KIND_TOKENIZER = "tokenizer"
 
-# Workspace limits (see the API reference in the site's Agents tab).
-MAX_TEXT_CHARS = 200_000
-MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024
+# Keep the payload small; the site draws a line chart and a log panel.
+MAX_CHART_POINTS = 120
+MAX_LOG_CHARS = 200_000
 MAX_NAME_CHARS = 240
 MAX_DESCRIPTION_CHARS = 4_000
 
-# Experiment numbers 0-11 are already occupied by the sample rows seeded into
-# the workspace, so the first real run of a fresh branch continues from 12.
-FIRST_EXPERIMENT_NUMBER = 12
+EXPERIMENT_STATUS_KEPT = "kept"
+EXPERIMENT_STATUS_DISCARDED = "discarded"
 
 STEP_RE = re.compile(
     r"^step\s+(?P<step>\d+)\s+\((?P<pct>[\d.]+)%\)\s*\|\s*loss:\s*(?P<loss>[\d.]+|nan|inf)"
@@ -82,10 +96,11 @@ TOKENIZER_FILES = ("tokenizer.pkl", "token_bytes.pt", "dataset.txt")
 REPO_ROOT = Path(__file__).resolve().parent
 ENV_PATH = REPO_ROOT / ".env"
 RESULTS_PATH = REPO_ROOT / "results.tsv"
+REPO_URL = "https://github.com/dustinwloring1988/autoresearch-win-rtx"
 
 
 # ---------------------------------------------------------------------------
-# Credentials
+# Workspace client
 # ---------------------------------------------------------------------------
 
 
@@ -119,74 +134,260 @@ def _post_json(url, payload, headers, timeout=120):
     return response.json()
 
 
-def resolve_project(env):
-    """Resolve the Supabase project to attach to, and check it is the right one.
+def _tus_metadata(**pairs):
+    return ",".join(f"{key} {base64.b64encode(str(value).encode()).decode()}" for key, value in pairs.items())
 
-    Returns (base_url, error). `error` is set when .env points at a project that
-    is not the one serving the agent API, which would otherwise surface as a
-    baffling "Bucket not found" per file.
-    """
-    base = (env.get("SUPABASE_URL") or env.get("AUTORESEARCH_SUPABASE_URL") or DEFAULT_SUPABASE_URL).rstrip("/")
-    if not base.startswith("http"):
-        base = f"https://{base}"
-    ref = project_ref(base)
-    if ref and ref != AGENT_PROJECT_REF:
-        return base, (
-            f"project mismatch: .env points at Supabase project '{ref}', but the workspace "
-            f"site and its experiments live in '{AGENT_PROJECT_REF}'. Files attached with "
-            f"'{ref}' keys can never reach this workspace (its experiment-artifacts bucket "
-            f"does not exist there). Paste credentials from project '{AGENT_PROJECT_REF}'."
+
+class Workspace:
+    """The autolabz workspace: agent API for runs, direct tables for the rest."""
+
+    def __init__(self, env):
+        self.base_url = (env.get("SUPABASE_URL") or DEFAULT_SUPABASE_URL).rstrip("/")
+        self.api = f"{self.base_url}{API_SUFFIX}"
+        self.token = (
+            env.get("AUTOLABZ_API_TOKEN")
+            or env.get("AUTORESEARCH_API_KEY")
+            or env.get("AUTOLABZ_TOKEN")
+            or ""
+        ).strip()
+        self.secret = (
+            env.get("SUPABASE_SECRET_KEY") or env.get("SUPABASE_SERVICE_KEY") or ""
+        ).strip()
+        self.missing = []
+        if not self.token:
+            self.missing.append("AUTOLABZ_API_TOKEN (ar_live_..., Settings -> API)")
+        if not self.secret:
+            self.missing.append("SUPABASE_SECRET_KEY (needed to write experiments)")
+        self.agent = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        self.service = {"apikey": self.secret, "Authorization": f"Bearer {self.secret}",
+                        "Content-Type": "application/json"}
+
+    # -- agent API ----------------------------------------------------------
+
+    def get_runs(self):
+        response = requests.get(f"{self.api}/runs", headers=self.agent, timeout=60)
+        if not response.ok:
+            raise RuntimeError(f"GET /runs failed ({response.status_code}): {response.text[:300]}")
+        return response.json().get("runs", [])
+
+    def create_run(self, name, repo_url, baseline_score):
+        response = requests.post(
+            f"{self.api}/runs",
+            headers=self.agent,
+            json={"name": name, "repo_url": repo_url, "baseline_score": baseline_score},
+            timeout=60,
         )
-    return base, None
+        if not response.ok:
+            raise RuntimeError(f"POST /runs failed ({response.status_code}): {response.text[:300]}")
+        return response.json().get("run", {})
+
+    def ensure_run(self, name, repo_url, baseline_score):
+        """Reuse the run with this name if it exists, so the loop never forks a new one."""
+        for run in self.get_runs():
+            if run.get("name") == name:
+                return run, False
+        return self.create_run(name, repo_url, baseline_score), True
+
+    # -- direct table access ------------------------------------------------
+
+    def _table(self, table, method="GET", rows=None, params=None, prefer_return=False):
+        headers = dict(self.service)
+        if prefer_return:
+            headers["Prefer"] = "return=representation"
+        url = f"{self.base_url}/rest/v1/{table}"
+        if method == "GET":
+            response = requests.get(url, headers=headers, params=params or {}, timeout=120)
+        elif method == "POST":
+            response = requests.post(url, headers=headers, json=rows, timeout=300)
+        elif method == "DELETE":
+            response = requests.delete(url, headers=headers, params=params or {}, timeout=120)
+        elif method == "PATCH":
+            response = requests.patch(url, headers=headers, json=rows, params=params or {}, timeout=120)
+        else:
+            raise ValueError(method)
+        if not response.ok:
+            raise RuntimeError(f"{method} {table} failed ({response.status_code}): {response.text[:300]}")
+        return response.json() if response.content else None
+
+    def experiments_for(self, run_id):
+        return self._table("experiments", params={"run_id": f"eq.{run_id}", "order": "experiment_number.asc"})
+
+    def run_files(self, run_id):
+        return self._table("run_files", params={"run_id": f"eq.{run_id}"})
+
+    def insert_experiment(self, row):
+        return self._table("experiments", "POST", [row], prefer_return=True)
+
+    def insert_metric_points(self, rows):
+        return self._table("metric_points", "POST", rows, prefer_return=True)
+
+    def put_artifacts(self, experiment_id, artifacts):
+        """Replace this experiment's artifacts, keyed by artifact_type."""
+        self._table("experiment_artifacts", "DELETE", params={"experiment_id": f"eq.{experiment_id}"})
+        rows = [
+            {"experiment_id": experiment_id, "artifact_type": kind, "content": content}
+            for kind, content in artifacts.items()
+            if content
+        ]
+        if rows:
+            self._table("experiment_artifacts", "POST", rows, prefer_return=True)
+
+    def update_run(self, run_id, values):
+        return self._table("research_runs", "PATCH", values, params={"id": f"eq.{run_id}"})
 
 
-def _static_token(env):
-    """A credential that needs no refresh: an explicit JWT or a service/secret key."""
-    for key in ("AUTORESEARCH_SUPABASE_JWT", "SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_KEY"):
-        token = (env.get(key) or "").strip()
-        if token:
-            return token, key
-    return None, None
+# ---------------------------------------------------------------------------
 
 
-def _is_expired(token):
-    try:
-        payload = token.split(".")[1]
-        payload += "=" * (-len(payload) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload))
-    except Exception:
-        return False  # opaque secret keys have no readable exp; use as-is
-    return claims.get("exp", 0) <= time.time() + 60
+    def upload_file(self, run_id, path, file_kind, user_id=None):
+        """Upload one file, splitting it if the platform cap requires it."""
+        path = Path(path)
+        size = path.stat().st_size
+        if size == 0:
+            return {"skipped": f"{path.name} is empty"}
+        if size > MAX_ARTIFACT_BYTES:
+            return {"skipped": f"{path.name} is {size / 1024**3:.2f} GB (over the 5 GB limit)"}
+        if size > MAX_OBJECT_BYTES:
+            return self._upload_split(run_id, path, file_kind, user_id, size)
+        return self._upload_one(run_id, path, file_kind, user_id)
 
+    def _upload_one(self, run_id, path, file_kind, user_id, display_name=None):
+        path = Path(path)
+        size = path.stat().st_size
+        name = display_name or path.name
+        remote_path = f"{run_id}/{file_kind}-{int(time.time() * 1000)}-{sanitize(name)}"
+        mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
 
-def mint_access_token(env, base_url):
-    """Exchange the refresh token or email/password for a user access token."""
-    refresh_token = env.get("AUTORESEARCH_SUPABASE_REFRESH_TOKEN")
-    if refresh_token:
-        return _post_json(
-            f"{base_url}/auth/v1/token?grant_type=refresh_token",
-            {"refresh_token": refresh_token},
-            {"apikey": refresh_token, "Content-Type": "application/json"},
-        )["access_token"]
+        if size <= PLAIN_UPLOAD_LIMIT:
+            error = self._put_object(remote_path, path, mime_type)
+        else:
+            error = self._put_object_tus(remote_path, path, mime_type, size)
+        if error:
+            return {"error": error}
 
-    email = env.get("AUTORESEARCH_SUPABASE_EMAIL")
-    password = env.get("AUTORESEARCH_SUPABASE_PASSWORD")
-    if email and password:
-        return _post_json(
-            f"{base_url}/auth/v1/token?grant_type=password",
-            {"email": email, "password": password},
-            {"apikey": email, "Content-Type": "application/json"},
-        )["access_token"]
+        row = {
+            "run_id": run_id,
+            "file_kind": file_kind,
+            "file_name": name,
+            "storage_path": remote_path,
+            "size_bytes": size,
+            "mime_type": mime_type,
+        }
+        # run_files.user_id is NOT NULL and points at the run's owner.
+        if user_id:
+            row["user_id"] = user_id
+        try:
+            self._table("run_files", "POST", [row], prefer_return=True)
+        except RuntimeError as exc:
+            self.delete_object(remote_path)
+            return {"error": f"run_files insert failed: {exc}"}
+        return {"file_name": name, "file_kind": file_kind, "size_bytes": size, "storage_path": remote_path}
 
-    return None
+    def _upload_split(self, run_id, path, file_kind, user_id, size):
+        """Split into ordered parts, because this project's plan caps objects at 50 MB.
 
+        The parts concatenate back into the original file byte for byte.
+        """
+        total = (size + SPLIT_PART_BYTES - 1) // SPLIT_PART_BYTES
+        parts, failures = [], []
+        with tempfile.TemporaryDirectory(prefix="autoresearch-split-") as tmp:
+            with Path(path).open("rb") as source:
+                for index in range(total):
+                    part_name = f"{path.name}.part{index + 1:02d}-of-{total:02d}"
+                    part_path = Path(tmp) / part_name
+                    remaining = SPLIT_PART_BYTES
+                    with part_path.open("wb") as target:
+                        while remaining > 0:
+                            chunk = source.read(min(8 * 1024 * 1024, remaining))
+                            if not chunk:
+                                break
+                            target.write(chunk)
+                            remaining -= len(chunk)
+                    outcome = self._upload_one(run_id, part_path, file_kind, user_id, display_name=part_name)
+                    if outcome.get("error") or outcome.get("skipped"):
+                        failures.append(f"{part_name}: {outcome.get('error') or outcome.get('skipped')}")
+                    else:
+                        parts.append(outcome)
 
-def resolve_user_token(env, base_url):
-    """Return a usable Supabase credential for attachments, or None."""
-    token, _ = _static_token(env)
-    if token and not _is_expired(token):
-        return token
-    return mint_access_token(env, base_url)
+        result = {"file_name": path.name, "file_kind": file_kind, "size_bytes": size,
+                  "parts": parts, "split": True}
+        if failures:
+            result["error"] = f"{len(failures)} of {total} parts failed: {failures[0]}"
+        return result
+
+    def _put_object(self, remote_path, path, mime_type):
+        path = Path(path)
+        with path.open("rb") as handle:
+            response = requests.post(
+                f"{self.base_url}/storage/v1/object/{STORAGE_BUCKET}/{remote_path}",
+                data=handle,
+                headers={**self._storage_auth(), "Content-Type": mime_type},
+                timeout=3600,
+            )
+        if not response.ok:
+            return f"storage upload failed ({response.status_code}): {response.text[:200]}"
+        return None
+
+    def _put_object_tus(self, remote_path, path, mime_type, size):
+        """Chunked resumable upload, for objects past the plain-POST ceiling."""
+        start = f"{self.base_url}/storage/v1/upload/resumable"
+        create = requests.post(
+            start,
+            data=b"",
+            headers={
+                **self._storage_auth(),
+                "Tus-Resumable": TUS_VERSION,
+                "Content-Length": "0",
+                "x-upsert": "false",
+                "Upload-Length": str(size),
+                # This storage build reads the object key from `objectName`.
+                "Upload-Metadata": _tus_metadata(
+                    objectName=remote_path, bucketName=STORAGE_BUCKET,
+                    contentType=mime_type, cacheControl="3600",
+                ),
+            },
+            timeout=300,
+        )
+        if create.status_code not in (200, 201):
+            return f"resumable upload could not start ({create.status_code}): {create.text[:200]}"
+        location = create.headers.get("Location", "")
+        if not location:
+            return "resumable upload returned no Location header"
+        if location.startswith("/"):
+            location = self.base_url + location
+
+        offset = int(create.headers.get("Upload-Offset", 0))
+        with Path(path).open("rb") as handle:
+            while offset < size:
+                chunk = handle.read(TUS_CHUNK)
+                if not chunk:
+                    break
+                patch = requests.patch(
+                    location,
+                    data=chunk,
+                    headers={
+                        **self._storage_auth(),
+                        "Tus-Resumable": TUS_VERSION,
+                        "Content-Type": "application/offset+octet-stream",
+                        "Upload-Offset": str(offset),
+                    },
+                    timeout=1800,
+                )
+                if patch.status_code not in (200, 204):
+                    requests.delete(location, headers=self._storage_auth(), timeout=120)
+                    return f"resumable chunk at offset {offset} failed ({patch.status_code}): {patch.text[:200]}"
+                offset = int(patch.headers.get("Upload-Offset", offset + len(chunk)))
+        return None
+
+    def _storage_auth(self):
+        return {"apikey": self.secret, "Authorization": f"Bearer {self.secret}"}
+
+    def delete_object(self, remote_path):
+        requests.delete(
+            f"{self.base_url}/storage/v1/object/{STORAGE_BUCKET}/{remote_path}",
+            headers=self._storage_auth(),
+            timeout=300,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +448,7 @@ def downsample(points, limit):
     return [points[int(i * stride)] for i in range(limit)]
 
 
-def build_train_log(raw, points, limit=MAX_TEXT_CHARS):
+def build_train_log(raw, points, limit=MAX_LOG_CHARS):
     """Rebuild the log for the site's terminal panel, keeping it under the cap.
 
     Step lines arrive carriage-return separated, so they are re-emitted one per
@@ -360,7 +561,7 @@ def build_experiment_md(name, hypothesis, sha, diff, summary, metadata):
         lines += ["## Hypothesis", "", hypothesis.strip(), ""]
     lines += ["## Change under test", "", f"Commit `{sha}`", ""]
     if diff:
-        lines += [f"```diff\n{_cap(diff, MAX_TEXT_CHARS // 2)}\n```", ""]
+        lines += [f"```diff\n{_cap(diff, MAX_LOG_CHARS // 2)}\n```", ""]
     else:
         lines += ["_No committed diff available for this run._", ""]
     lines += ["## Run configuration", ""]
@@ -373,7 +574,7 @@ def build_experiment_md(name, hypothesis, sha, diff, summary, metadata):
     for key, value in sorted(metadata.items()):
         if key not in summary:
             lines.append(f"- **{key}**: {value}")
-    return _cap("\n".join(lines), MAX_TEXT_CHARS)
+    return _cap("\n".join(lines), MAX_LOG_CHARS)
 
 
 def build_results_md(name, metric, baseline, status, summary, verdict, extra=""):
@@ -401,7 +602,7 @@ def build_results_md(name, metric, baseline, status, summary, verdict, extra="")
         lines += ["", "## Verdict", "", verdict.strip()]
     if extra:
         lines += ["", extra.strip()]
-    return _cap("\n".join(lines), MAX_TEXT_CHARS)
+    return _cap("\n".join(lines), MAX_LOG_CHARS)
 
 
 # ---------------------------------------------------------------------------
@@ -444,76 +645,17 @@ def sanitize(name, limit=120):
     return cleaned or "file"
 
 
-def storage_path(experiment_id, kind, file_name):
-    unique = uuid.uuid4().hex
-    return f"experiments/{experiment_id}/{kind}-{unique}-{sanitize(file_name)}"
-
-
-def attach_artifact(token, experiment_id, path, kind, base_url):
-    path = Path(path)
-    size = path.stat().st_size
-    if size == 0:
-        return {"skipped": f"{path.name} is empty"}
-    if size > MAX_ARTIFACT_BYTES:
-        return {"skipped": f"{path.name} is {size / 1024**3:.2f} GB (limit 2 GB)"}
-
-    object_api = f"{base_url}/storage/v1/object/{STORAGE_BUCKET}"
-    remote_path = storage_path(experiment_id, kind, path.name)
-    mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    auth = {"Authorization": f"Bearer {token}", "apikey": token}
-
-    with path.open("rb") as handle:
-        response = requests.post(
-            f"{object_api}/{remote_path}",
-            data=handle,
-            headers={**auth, "Content-Type": mime_type, "x-upsert": "false"},
-            timeout=3600,
-        )
-    if not response.ok:
-        hint = ""
-        if "NoSuchBucket" in response.text or "Bucket not found" in response.text:
-            hint = (
-                f" — the '{STORAGE_BUCKET}' bucket does not exist in project "
-                f"'{project_ref(base_url)}', so these credentials belong to a different "
-                f"workspace than '{AGENT_PROJECT_REF}'."
-            )
-        return {"error": f"storage upload failed ({response.status_code}): {response.text[:200]}{hint}"}
-
-    row = {
-        "experiment_id": experiment_id,
-        "kind": kind,
-        "file_name": path.name,
-        "storage_path": remote_path,
-        "mime_type": mime_type,
-        "size_bytes": size,
-    }
-    response = requests.post(
-        f"{base_url}/rest/v1/{ARTIFACT_TABLE}",
-        json=row,
-        headers={**auth, "Content-Type": "application/json", "Prefer": "return=representation"},
-        timeout=120,
-    )
-    if not response.ok:
-        requests.delete(f"{object_api}/{remote_path}", headers=auth, timeout=120)
-        return {"error": f"artifact row insert failed ({response.status_code}): {response.text[:200]}"}
-
-    return {"file_name": path.name, "kind": kind, "size_bytes": size, "storage_path": remote_path}
-
-
-def collect_artifacts(summary, log_path):
-    """Every file that documents this run: model, tokenizer, and the raw log."""
+def collect_run_files(summary):
+    """The model and tokenizer files for a run, in the workspace's two kinds."""
     wanted = []
-    checkpoint = Path(CHECKPOINT_NAME)
-    if checkpoint.exists():
-        wanted.append((checkpoint, "model"))
     tok_dir = tokenizer_dir(summary.get("dataset"))
     for file_name in TOKENIZER_FILES:
         candidate = tok_dir / file_name
         if candidate.exists():
-            wanted.append((candidate, "tokenizer"))
-    log_path = Path(log_path)
-    if log_path.exists():
-        wanted.append((log_path, "train_log"))
+            wanted.append((candidate, FILE_KIND_TOKENIZER))
+    checkpoint = Path(CHECKPOINT_NAME)
+    if checkpoint.exists():
+        wanted.append((checkpoint, FILE_KIND_MODEL))
     return wanted
 
 
@@ -521,10 +663,9 @@ def collect_artifacts(summary, log_path):
 # results.tsv
 # ---------------------------------------------------------------------------
 
-RESULTS_HEADER = "commit\tval_bpb\tmemory_gb\tstatus\tdescription"
+RESULTS_HEADER = "commit\tval_bpb\tmemory_gb\tstatus\tdescription\texperiment"
 TSV_STATUS = {"kept": "keep", "discarded": "discard", "keep": "keep", "discard": "discard"}
 KEEP_STATUSES = {"keep", "kept"}
-PUBLISHED_STATUSES = KEEP_STATUSES | {"discard", "discarded"}
 
 
 def read_results_tsv(path=RESULTS_PATH):
@@ -539,14 +680,14 @@ def read_results_tsv(path=RESULTS_PATH):
     return rows[1:] if rows and rows[0][0].strip() == "commit" else rows
 
 
-def append_results_tsv(sha, metric, peak_vram_gb, status, description, path=RESULTS_PATH):
+def append_results_tsv(sha, metric, peak_vram_gb, status, description, experiment="", path=RESULTS_PATH):
     path = Path(path)
     metric_text = f"{metric:.6f}" if metric is not None else "0.000000"
     memory_text = f"{peak_vram_gb:.1f}" if peak_vram_gb is not None else "0.0"
     tsv_status = TSV_STATUS.get(status, status)
     # Tabs and newlines would break the column layout.
     clean = re.sub(r"\s+", " ", str(description)).strip()
-    row = f"{sha}\t{metric_text}\t{memory_text}\t{tsv_status}\t{clean}"
+    row = f"{sha}\t{metric_text}\t{memory_text}\t{tsv_status}\t{clean}\t{experiment}"
     if not path.exists():
         path.write_text(RESULTS_HEADER + "\n", encoding="utf-8")
     with path.open("a", encoding="utf-8") as handle:
@@ -556,14 +697,21 @@ def append_results_tsv(sha, metric, peak_vram_gb, status, description, path=RESU
 
 
 def next_experiment_number(rows):
-    """Continue the workspace numbering after the seeded sample rows.
+    """Next workspace experiment_number.
 
-    results.tsv has no number column, so the count of published runs drives it.
-    Crashes are recorded locally but never uploaded, so they do not consume a
-    number; pass --number to pin one explicitly if an upload ever fails.
+    The workspace numbers experiments from 1 per run, so read the numbers out of
+    the last column rather than counting rows: a crash is recorded with an empty
+    number (it is never published) and must not consume one.
     """
-    published = sum(1 for row in rows if len(row) >= 4 and row[3].strip().lower() in PUBLISHED_STATUSES)
-    return FIRST_EXPERIMENT_NUMBER + published
+    numbers = []
+    for row in rows:
+        if len(row) < 6:
+            continue
+        try:
+            numbers.append(int(row[5]))
+        except ValueError:
+            continue
+    return max(numbers) + 1 if numbers else 1
 
 
 def best_metric(rows):
@@ -578,6 +726,10 @@ def best_metric(rows):
     return min(values) if values else None
 
 
+def already_published(rows, sha):
+    return any(row and row[0].strip() == sha for row in rows)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -588,17 +740,18 @@ def main(argv=None):
     parser.add_argument("--name", required=True, help="Short experiment name (<=240 chars).")
     parser.add_argument("--hypothesis", default="", help="Markdown hypothesis, stored as experiment.md.")
     parser.add_argument("--results", default="", help="Extra markdown appended to results.md.")
-    parser.add_argument("--status", choices=("kept", "discarded"), default="kept")
+    parser.add_argument("--status", choices=(EXPERIMENT_STATUS_KEPT, EXPERIMENT_STATUS_DISCARDED),
+                        default=EXPERIMENT_STATUS_KEPT)
     parser.add_argument("--number", type=int, default=None, help="experiment_number (default: next free).")
+    parser.add_argument("--run-name", default="autoresearch-win-rtx", help="Workspace run to publish into.")
     parser.add_argument("--log", default="run.log", help="Path to the captured terminal output.")
     parser.add_argument("--files", dest="files", action="store_true", default=True,
-                        help="Attach model, tokenizer and log files (default).")
+                        help="Attach the tokenizer (once per run) and, when kept, the checkpoint.")
     parser.add_argument("--no-files", dest="files", action="store_false")
-    parser.add_argument("--dry-run", action="store_true", help="Build and print the payload, upload nothing.")
+    parser.add_argument("--dry-run", action="store_true", help="Build and print the payload, publish nothing.")
     args = parser.parse_args(argv)
 
     env = {**load_dotenv(), **os.environ}
-    api_key = env.get("AUTORESEARCH_API_KEY", "").strip()
 
     if not args.log or not Path(args.log).exists():
         print(f"FAIL: no log file at {args.log!r}; nothing to report.", file=sys.stderr)
@@ -619,12 +772,14 @@ def main(argv=None):
     rows = read_results_tsv()
     number = args.number if args.number is not None else next_experiment_number(rows)
     prior_best = best_metric(rows)
-    baseline = prior_best if prior_best is not None else metric
     status = args.status
     if metric is None:
-        print(f"FAIL: {args.log} has no val_bpb; recording a crash without uploading.", file=sys.stderr)
+        print(f"FAIL: {args.log} has no val_bpb; recording a crash without publishing.", file=sys.stderr)
         append_results_tsv(sha, None, None, "crash", args.name)
         return 1
+    if already_published(rows, sha):
+        print(f"NOTE: commit {sha} is already in results.tsv; not publishing it twice.")
+        return 0
 
     metadata = dict(header)
     for key in summary:
@@ -641,79 +796,146 @@ def main(argv=None):
 
     if prior_best is None:
         verdict = f"Baseline run: this establishes the reference val_bpb of {metric:.6f}."
+        delta = 0.0
     elif metric < prior_best:
         verdict = f"Kept: new best val_bpb, {prior_best - metric:+.6f} against the previous {prior_best:.6f}."
+        delta = metric - prior_best
     else:
         verdict = f"Discarded: {metric - prior_best:+.6f} against the best val_bpb of {prior_best:.6f}."
+        delta = metric - prior_best
 
-    run = {
-        "experiment_number": number,
-        "name": args.name[:MAX_NAME_CHARS],
-        "metric": metric,
-        "baseline_metric": baseline,
-        "metric_label": "Validation BPP",
-        "metric_direction": "lower",
-        "status": status,
-        "description": short_description(args.hypothesis) or args.name[:MAX_DESCRIPTION_CHARS],
-        "experiment_md": build_experiment_md(args.name, args.hypothesis, sha, diff, summary, metadata),
-        "results_md": build_results_md(args.name, metric, prior_best, status, summary, verdict, args.results),
-        "train_log": build_train_log(raw, points),
-        "metadata": {key: str(value) for key, value in metadata.items()},
-        "chart_data": build_chart_data(points),
-        "commit_sha": sha,
-        "duration_seconds": int(duration) if duration else None,
-    }
-    run = {key: value for key, value in run.items() if value is not None}
+    train_log = build_train_log(raw, points)
+    experiment_md = build_experiment_md(args.name, args.hypothesis, sha, diff, summary, metadata)
+    results_md = build_results_md(args.name, metric, prior_best, status, summary, verdict, args.results)
+    chart = build_chart_data(points, MAX_CHART_POINTS)
 
     if args.dry_run:
-        preview = dict(run)
-        preview["train_log"] = f"<{len(run['train_log'])} chars>"
-        print(json.dumps(preview, indent=2))
-        print(f"\nresults.tsv row: {sha}\t{metric:.6f}\t{peak_vram_gb}\t{status}\t{args.name}")
+        print(json.dumps({
+            "experiment_number": number,
+            "name": args.name[:MAX_NAME_CHARS],
+            "status": status,
+            "score": metric,
+            "delta": round(delta, 6),
+            "duration_seconds": int(duration) if duration else None,
+            "description": short_description(args.hypothesis) or args.name[:MAX_DESCRIPTION_CHARS],
+            "experiment_md": f"<{len(experiment_md)} chars>",
+            "results_md": f"<{len(results_md)} chars>",
+            "train_log": f"<{len(train_log)} chars>",
+            "metric_points": len(chart),
+            "commit_sha": sha,
+            "metadata_keys": len(metadata),
+        }, indent=2))
+        print(f"\nresults.tsv row: {sha}\t{metric:.6f}\t{peak_vram_gb}\t{status}\t{args.name}\t{number}")
         return 0
 
-    if not api_key:
-        print("FAIL: AUTORESEARCH_API_KEY is not set (add it to .env).", file=sys.stderr)
+    workspace = Workspace(env)
+    if workspace.missing:
+        print("FAIL: missing credentials in .env: " + "; ".join(workspace.missing), file=sys.stderr)
         return 2
 
-    response = requests.post(
-        AGENT_API,
-        json={"action": "upload_run", "run": run},
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        timeout=180,
-    )
-    if not response.ok:
-        print(f"FAIL: upload_run failed ({response.status_code}): {response.text[:500]}", file=sys.stderr)
-        return 1
-    experiment = response.json().get("experiment", {})
-    experiment_id = experiment.get("id")
-    print(f"Uploaded experiment #{number} ({experiment_id}): {args.name} val_bpb={metric:.6f} [{status}]")
+    run, created = workspace.ensure_run(args.run_name, REPO_URL, prior_best if prior_best is not None else metric)
+    run_id = run["id"]
+    if created:
+        print(f"Created run '{run['name']}' ({run_id}), baseline_score={run.get('baseline_score')}")
 
-    if args.files and not experiment_id:
-        print("NOTE: the API returned no experiment id; skipping file attachments.")
-    elif args.files:
-        base_url, project_error = resolve_project(env)
-        if project_error:
-            print(f"NOTE: {project_error}")
-            print("      Skipping file attachments; the run itself is published.")
-        else:
-            token = resolve_user_token(env, base_url)
-            if not token:
-                print("NOTE: no Supabase credential in .env for attachments; skipping files.")
-            else:
-                for path, kind in collect_artifacts(summary, args.log):
-                    outcome = attach_artifact(token, experiment_id, path, kind, base_url)
-                    if outcome.get("file_name"):
-                        print(f"  attached {kind}/{outcome['file_name']} "
-                              f"({outcome['size_bytes'] / 1024 / 1024:.1f} MB)")
-                    elif outcome.get("skipped"):
-                        print(f"  skipped {outcome['skipped']}")
-                    else:
-                        print(f"  FAILED {kind}/{path.name}: {outcome.get('error')}")
+    experiment_id = str(uuid.uuid4())
+    workspace.insert_experiment({
+        "id": experiment_id,
+        "run_id": run_id,
+        "experiment_number": number,
+        "name": args.name[:MAX_NAME_CHARS],
+        "status": status,
+        "score": metric,
+        "delta": round(delta, 6),
+        "duration_seconds": int(duration) if duration else 0,
+    })
 
-    append_results_tsv(sha, metric, peak_vram_gb, status, args.name)
-    print(f"Recorded {sha}\t{metric:.6f}\t{peak_vram_gb}\t{status}\t{args.name} in results.tsv")
+    if chart:
+        smoothed = None
+        points_to_write = []
+        for point in chart:
+            smoothed = point["loss"] if smoothed is None else 0.7 * smoothed + 0.3 * point["loss"]
+            points_to_write.append({
+                "experiment_id": experiment_id,
+                "step": point["step"],
+                "train_loss": point["loss"],
+                "smoothed_loss": round(smoothed, 6),
+            })
+        workspace.insert_metric_points(points_to_write)
+
+    workspace.put_artifacts(experiment_id, {
+        ARTIFACT_EXPERIMENT: experiment_md,
+        ARTIFACT_RESULTS: results_md,
+        ARTIFACT_TRAIN_LOG: train_log,
+    })
+
+    refresh_run_summary(workspace, run_id, prior_baseline=run.get("baseline_score"))
+    print(f"Published experiment #{number} ({experiment_id}) in run '{run['name']}': "
+          f"{args.name} score={metric:.6f} delta={delta:+.6f} [{status}]")
+
+    if args.files:
+        attach_files(workspace, run_id, summary, status, user_id=run.get("user_id"))
+
+    append_results_tsv(sha, metric, peak_vram_gb, status, args.name, str(number))
+    print(f"Recorded {sha}\t{metric:.6f}\t{peak_vram_gb}\t{status}\t{args.name}\t{number} in results.tsv")
     return 0
+
+
+def refresh_run_summary(workspace, run_id, prior_baseline=None):
+    """Recompute the run's counters the site's leaderboard reads."""
+    experiments = workspace.experiments_for(run_id)
+    kept = [e for e in experiments if e.get("status") == EXPERIMENT_STATUS_KEPT]
+    scores = [e["score"] for e in kept if isinstance(e.get("score"), (int, float))]
+    baseline = prior_baseline
+    if baseline is None:
+        baseline = min((e["score"] for e in experiments if isinstance(e.get("score"), (int, float))),
+                       default=0.0)
+    values = {
+        "total_experiments": len(experiments),
+        "kept_improvements": len(kept),
+        "best_score": min(scores) if scores else baseline,
+        "status": "running",
+    }
+    if baseline is not None:
+        values["baseline_score"] = baseline
+    workspace.update_run(run_id, values)
+    return values
+
+
+def attach_files(workspace, run_id, summary, status, user_id=None):
+    """Tokenizer once per run; the checkpoint on runs we keep.
+
+    Files belong to the run rather than to one experiment, so re-uploading the
+    identical tokenizer on every experiment would only burn storage.
+    """
+    existing = workspace.run_files(run_id)
+    have_tokenizer = any(f.get("file_kind") == FILE_KIND_TOKENIZER for f in existing)
+    want_model = status == EXPERIMENT_STATUS_KEPT
+
+    for path, file_kind in collect_run_files(summary):
+        if file_kind == FILE_KIND_TOKENIZER and have_tokenizer:
+            continue
+        outcome = workspace.upload_file(run_id, path, file_kind, user_id=user_id)
+        if outcome.get("split"):
+            parts = outcome.get("parts", [])
+            failed = outcome.get("error")
+            if failed:
+                print(f"  FAILED {file_kind}/{path.name}: {failed}")
+            if parts:
+                print(f"  attached {file_kind}/{path.name} as {len(parts)} parts "
+                      f"({outcome['size_bytes'] / 1024**2:.0f} MB total, "
+                      f"{parts[0]['file_name']} ... {parts[-1]['file_name']})")
+                print(f"    reassemble with: cat {path.name}.part* > {path.name}")
+        elif outcome.get("file_name"):
+            print(f"  attached {outcome['file_kind']}/{outcome['file_name']} "
+                  f"({outcome['size_bytes'] / 1024 / 1024:.1f} MB)")
+        elif outcome.get("skipped"):
+            print(f"  skipped {outcome['skipped']}")
+        else:
+            print(f"  FAILED {file_kind}/{path.name}: {outcome.get('error')}")
+
+    if not want_model:
+        print("  (checkpoint not uploaded: experiment was not kept)")
 
 
 if __name__ == "__main__":

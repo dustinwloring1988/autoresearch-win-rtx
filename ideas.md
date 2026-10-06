@@ -14,10 +14,26 @@ uncommitted work, and the ledger is exactly the thing you cannot afford to lose.
 
 | date | idea | source | outcome |
 | --- | --- | --- | --- |
-| 2026-10-06 | baseline, unmodified recipe | — | kept #13 (0.990164) |
-| 2026-10-06 | autotune: 16 GB tier fix + geometry-keyed cache | from reading the baseline log, not a sub-agent | kept #14 (0.916360) |
-| 2026-10-06 | `widen-steps-384`: ASPECT_RATIO 64→48, HEAD_DIM 128→96 (width 512→384) | arXiv:2505.20802, arXiv:2506.09342 | discarded #15 (1.060218, +15.7%) |
+| 2026-10-06 | baseline, unmodified recipe | — | kept, experiment #1 (0.990164) |
+| 2026-10-06 | autotune: 16 GB tier fix + geometry-keyed cache | from reading the baseline log, not a sub-agent | kept, experiment #2 (0.916360) |
+| 2026-10-06 | `widen-steps-384`: ASPECT_RATIO 64→48, HEAD_DIM 128→96 (width 512→384) | arXiv:2505.20802, arXiv:2506.09342 | discarded, experiment #3 (1.060218, +15.7%) |
 | 2026-10-06 | smaller `TOTAL_BATCH_SIZE` to buy optimizer steps without shrinking the model | — | pending — next round |
+| 2026-10-06 | pin the eval batch so the scored val subset stops moving with the micro-batch | — | pending, bundle with the next run |
+
+## Platform switch (2026-10-06)
+
+Reporting moved from `autoresearch.bolt.host` to **autolabz.bolt.host** (Supabase project
+`rrvalubtixdiecurxpqa`). Experiments #1-#3 above are the three runs that existed at the time,
+replayed into the new site with their markdown, logs and loss curves. Two things to know:
+
+- **The kept run's checkpoint (#2) is gone.** Every run overwrites
+  `checkpoint_pre_eval.pt`, and the run after #2 was the discarded #3, so the only checkpoint
+  on disk belongs to #3. Nothing was uploaded for #2 rather than mislabel #3's weights as
+  the best model. From now on `report.py` uploads the checkpoint whenever an experiment is
+  kept, so this cannot recur.
+- **Objects are capped at 50 MB by the project plan**, not by the bucket (which allows
+  5 GiB): plain POST and TUS both refuse above it. The ~96 MB checkpoint is uploaded as
+  three ordered parts that concatenate back byte for byte.
 
 ## Measured regime (re-check these before theorising)
 
