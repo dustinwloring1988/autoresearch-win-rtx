@@ -13,6 +13,7 @@ To set up a new experiment, work with the user to:
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — the file you modify. Model architecture, optimizer, training loop.
    - `report.py` — publishes finished runs to the research workspace. Do not modify; call it.
+   - `ideas.md` — the ledger of ideas already proposed and their outcomes. Append to it.
 4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 5. **Verify reporting credentials**: every run gets published to the research workspace at https://autoresearch.bolt.host by `report.py`. Confirm `.env` exists and holds a non-empty `AUTORESEARCH_API_KEY`. That file is gitignored: never commit it, never echo the value into a run log, a commit message, or your own output. If the file is missing or empty, stop and ask the human for the key (it is created in Settings → Models & keys on the site) before running any experiments.
 6. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run. Note that experiment numbers 0-11 are already occupied by the sample rows that ship with the site, so this branch's first run is published as #12. `report.py` assigns the number itself — do not pass one unless an upload failed and you need to fill the gap.
@@ -101,26 +102,60 @@ Use `--dry-run` to print the exact payload without uploading, and `--no-files` t
 
 If attachments are skipped with "no Supabase user token", the run is still published — see Workspace API notes below.
 
+## Ideation: sub-agents propose the experiments
+
+You do not come up with the next idea alone. Once a run is reported and you know what the current best is, spawn **two sub-agents in parallel** (Task tool, `general` subagent type) and let each propose one experiment. Divergence is the entire point, so the two briefs must be disjoint — the same brief twice produces the same idea twice.
+
+Rotate the briefs so consecutive rounds do not orbit the same subsystem. Assign one sub-agent the **next domain in the rotation** and the other the domain after it:
+
+| Rotation | Domain A | Domain B |
+| --- | --- | --- |
+| 1 | architecture: attention, windowing, positional encoding, residual/norm structure | optimization: LR schedules, warmup/warmdown, Muon/AdamW mix, betas, weight decay |
+| 2 | initialization, scaling, muP-style balancing, depth/width ratio | regularization, dropout, data augmentation-free regularization, loss shaping |
+| 3 | tokenizer-free efficiency: batch size, grad accumulation, activation checkpointing, fused paths | loss function, auxiliary objectives, value embeddings, prediction heads |
+| 4 | anything left, re-weighted by what results.tsv has not covered yet | the domain with the largest unexplained gap |
+
+Each sub-agent must:
+
+1. **Web-search recent arXiv work** (2025-2026 preferred) in ML/AI. Cite at least two papers by title and arXiv id, and state the concrete finding you are borrowing — not a vibe, a number or a mechanism.
+2. **Read `train.py`** to see what the code already does, and **read `results.tsv`** so it does not propose something already tried here.
+3. **Check the ledger in `ideas.md`** and not re-propose anything listed there.
+4. Return **exactly one** idea, small enough to be a focused diff in `train.py`, with:
+   - the paper(s) it comes from and the mechanism being borrowed,
+   - the concrete edit: constants, functions, line references, and the new value,
+   - the expected effect on `val_bpb` and roughly how big,
+   - the risks: VRAM, wall-clock, numerical stability, likelihood of crashing,
+   - a one-line fallback if it OOMs (the next smaller setting to try).
+5. Respect the hard constraints: `train.py` only, no new dependencies, no new data, `prepare.py` and `evaluate_bpb` untouched, must finish inside the 5-minute budget.
+
+Then **you pick one**. Choose on expected gain per unit of risk, sanity-check that it is not a near-duplicate of an earlier run, and write one sentence saying which you picked and why the other lost. Then implement only that one.
+
+**Reuse beats re-ideating.** Keep the runner-up idea from the round. If the idea you picked crashes or is reverted, try the runner-up before paying for another round of sub-agents.
+
+**Ledger**: append one line per proposal to `ideas.md` — date, one-line name, source paper, and outcome (`pending` / `kept #N` / `discarded #N` / `crashed #N`). This is how an overnight loop avoids circling the same idea forever.
+
 ## The experiment loop
 
 The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
 
 LOOP FOREVER:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Decide keep or discard against the best `val_bpb` in `results.tsv` (the local record of what has been published), then publish the run exactly once:
+1. Look at the git state: the current branch/commit we're on, and `results.tsv` for the best val_bpb so far
+2. Pick the next experiment: run the ideation stage above (two sub-agents, two disjoint domains) unless you still have an untried runner-up from the last round
+3. Tune `train.py` with that idea by directly hacking the code.
+4. git commit
+5. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
+6. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+7. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
+8. Decide keep or discard against the best `val_bpb` in `results.tsv` (the local record of what has been published), then publish the run exactly once:
    - improved or equal-and-simpler: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status kept`
    - worse: `uv run python report.py --name "<slug>" --hypothesis "<what and why>" --status discarded`
    - crashed: `uv run python report.py --name "<slug>" --hypothesis "<what and why>"` (records the crash, uploads nothing)
 
    **Report before you reset.** `report.py` captures the commit hash and its diff of `train.py`, so the experiment commit must still be HEAD when it runs.
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+9. Mark the outcome of this idea in the `ideas.md` ledger with its run number
+10. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
+11. If val_bpb is equal or worse, you git reset back to where you started
 
 The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
 

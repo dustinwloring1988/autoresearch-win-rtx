@@ -21,3 +21,9 @@ AGENTS.md
 
 # Experimental code/artifacts
 dev/
+
+# Run outputs (large or per-run; the workspace site is the record of truth)
+checkpoint_pre_eval.pt
+run*.log
+logs/
+results.tsv
