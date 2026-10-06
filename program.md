@@ -153,7 +153,7 @@ LOOP FOREVER:
    - crashed: `uv run python report.py --name "<slug>" --hypothesis "<what and why>"` (records the crash, uploads nothing)
 
    **Report before you reset.** `report.py` captures the commit hash and its diff of `train.py`, so the experiment commit must still be HEAD when it runs.
-9. Mark the outcome of this idea in the `ideas.md` ledger with its run number
+9. Mark the outcome of this idea in the `ideas.md` ledger with its run number, and **commit the ledger before any `git reset`** — the discard step below throws away uncommitted work
 10. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
 11. If val_bpb is equal or worse, you git reset back to where you started
 
