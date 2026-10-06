@@ -38,15 +38,26 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
 AGENT_API = "https://tjstztttrdyuwxzucheq.supabase.co/functions/v1/agent-api"
-SUPABASE_URL = "https://tjstztttrdyuwxzucheq.supabase.co"
+DEFAULT_SUPABASE_URL = "https://tjstztttrdyuwxzucheq.supabase.co"
 STORAGE_BUCKET = "experiment-artifacts"
 ARTIFACT_TABLE = "experiment_artifacts"
-STORAGE_OBJECT_API = f"{SUPABASE_URL}/storage/v1/object"
-REST_API = f"{SUPABASE_URL}/rest/v1"
+
+
+def project_ref(url):
+    """The Supabase project id inside a project URL (ref.supabase.co)."""
+    host = urlparse(url).hostname or ""
+    return host.split(".")[0]
+
+
+# Attachments must land in the same project that serves the agent API, because
+# that is where the experiment row lives and experiment_artifacts has a foreign
+# key to it. A key from any other project cannot work.
+AGENT_PROJECT_REF = project_ref(AGENT_API)
 
 # Workspace limits (see the API reference in the site's Agents tab).
 MAX_TEXT_CHARS = 200_000
@@ -108,12 +119,52 @@ def _post_json(url, payload, headers, timeout=120):
     return response.json()
 
 
-def mint_access_token(env):
+def resolve_project(env):
+    """Resolve the Supabase project to attach to, and check it is the right one.
+
+    Returns (base_url, error). `error` is set when .env points at a project that
+    is not the one serving the agent API, which would otherwise surface as a
+    baffling "Bucket not found" per file.
+    """
+    base = (env.get("SUPABASE_URL") or env.get("AUTORESEARCH_SUPABASE_URL") or DEFAULT_SUPABASE_URL).rstrip("/")
+    if not base.startswith("http"):
+        base = f"https://{base}"
+    ref = project_ref(base)
+    if ref and ref != AGENT_PROJECT_REF:
+        return base, (
+            f"project mismatch: .env points at Supabase project '{ref}', but the workspace "
+            f"site and its experiments live in '{AGENT_PROJECT_REF}'. Files attached with "
+            f"'{ref}' keys can never reach this workspace (its experiment-artifacts bucket "
+            f"does not exist there). Paste credentials from project '{AGENT_PROJECT_REF}'."
+        )
+    return base, None
+
+
+def _static_token(env):
+    """A credential that needs no refresh: an explicit JWT or a service/secret key."""
+    for key in ("AUTORESEARCH_SUPABASE_JWT", "SUPABASE_SECRET_KEY", "SUPABASE_SERVICE_KEY"):
+        token = (env.get(key) or "").strip()
+        if token:
+            return token, key
+    return None, None
+
+
+def _is_expired(token):
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return False  # opaque secret keys have no readable exp; use as-is
+    return claims.get("exp", 0) <= time.time() + 60
+
+
+def mint_access_token(env, base_url):
     """Exchange the refresh token or email/password for a user access token."""
     refresh_token = env.get("AUTORESEARCH_SUPABASE_REFRESH_TOKEN")
     if refresh_token:
         return _post_json(
-            f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
+            f"{base_url}/auth/v1/token?grant_type=refresh_token",
             {"refresh_token": refresh_token},
             {"apikey": refresh_token, "Content-Type": "application/json"},
         )["access_token"]
@@ -122,7 +173,7 @@ def mint_access_token(env):
     password = env.get("AUTORESEARCH_SUPABASE_PASSWORD")
     if email and password:
         return _post_json(
-            f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+            f"{base_url}/auth/v1/token?grant_type=password",
             {"email": email, "password": password},
             {"apikey": email, "Content-Type": "application/json"},
         )["access_token"]
@@ -130,21 +181,12 @@ def mint_access_token(env):
     return None
 
 
-def resolve_user_token(env):
-    """Return a usable Supabase user access token, or None if unavailable."""
-    def expired(token):
-        try:
-            payload = token.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(payload))
-        except Exception:
-            return False
-        return claims.get("exp", 0) <= time.time() + 60
-
-    token = env.get("AUTORESEARCH_SUPABASE_JWT")
-    if token and not expired(token):
+def resolve_user_token(env, base_url):
+    """Return a usable Supabase credential for attachments, or None."""
+    token, _ = _static_token(env)
+    if token and not _is_expired(token):
         return token
-    return mint_access_token(env)
+    return mint_access_token(env, base_url)
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +449,7 @@ def storage_path(experiment_id, kind, file_name):
     return f"experiments/{experiment_id}/{kind}-{unique}-{sanitize(file_name)}"
 
 
-def attach_artifact(token, experiment_id, path, kind):
+def attach_artifact(token, experiment_id, path, kind, base_url):
     path = Path(path)
     size = path.stat().st_size
     if size == 0:
@@ -415,24 +457,27 @@ def attach_artifact(token, experiment_id, path, kind):
     if size > MAX_ARTIFACT_BYTES:
         return {"skipped": f"{path.name} is {size / 1024**3:.2f} GB (limit 2 GB)"}
 
+    object_api = f"{base_url}/storage/v1/object/{STORAGE_BUCKET}"
     remote_path = storage_path(experiment_id, kind, path.name)
     mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "apikey": token,
-        "Content-Type": mime_type,
-        "x-upsert": "false",
-    }
+    auth = {"Authorization": f"Bearer {token}", "apikey": token}
 
     with path.open("rb") as handle:
         response = requests.post(
-            f"{STORAGE_OBJECT_API}/{STORAGE_BUCKET}/{remote_path}",
+            f"{object_api}/{remote_path}",
             data=handle,
-            headers=headers,
+            headers={**auth, "Content-Type": mime_type, "x-upsert": "false"},
             timeout=3600,
         )
     if not response.ok:
-        return {"error": f"storage upload failed ({response.status_code}): {response.text[:200]}"}
+        hint = ""
+        if "NoSuchBucket" in response.text or "Bucket not found" in response.text:
+            hint = (
+                f" — the '{STORAGE_BUCKET}' bucket does not exist in project "
+                f"'{project_ref(base_url)}', so these credentials belong to a different "
+                f"workspace than '{AGENT_PROJECT_REF}'."
+            )
+        return {"error": f"storage upload failed ({response.status_code}): {response.text[:200]}{hint}"}
 
     row = {
         "experiment_id": experiment_id,
@@ -443,22 +488,13 @@ def attach_artifact(token, experiment_id, path, kind):
         "size_bytes": size,
     }
     response = requests.post(
-        f"{REST_API}/{ARTIFACT_TABLE}",
+        f"{base_url}/rest/v1/{ARTIFACT_TABLE}",
         json=row,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "apikey": token,
-            "Content-Type": "application/json",
-            "Prefer": "return=representation",
-        },
+        headers={**auth, "Content-Type": "application/json", "Prefer": "return=representation"},
         timeout=120,
     )
     if not response.ok:
-        requests.delete(
-            f"{STORAGE_OBJECT_API}/{STORAGE_BUCKET}/{remote_path}",
-            headers={"Authorization": f"Bearer {token}", "apikey": token},
-            timeout=120,
-        )
+        requests.delete(f"{object_api}/{remote_path}", headers=auth, timeout=120)
         return {"error": f"artifact row insert failed ({response.status_code}): {response.text[:200]}"}
 
     return {"file_name": path.name, "kind": kind, "size_bytes": size, "storage_path": remote_path}
@@ -656,19 +692,24 @@ def main(argv=None):
     if args.files and not experiment_id:
         print("NOTE: the API returned no experiment id; skipping file attachments.")
     elif args.files:
-        token = resolve_user_token(env)
-        if not token:
-            print("NOTE: no Supabase user token in .env; skipping file attachments.")
+        base_url, project_error = resolve_project(env)
+        if project_error:
+            print(f"NOTE: {project_error}")
+            print("      Skipping file attachments; the run itself is published.")
         else:
-            for path, kind in collect_artifacts(summary, args.log):
-                outcome = attach_artifact(token, experiment_id, path, kind)
-                if outcome.get("file_name"):
-                    print(f"  attached {kind}/{outcome['file_name']} "
-                          f"({outcome['size_bytes'] / 1024 / 1024:.1f} MB)")
-                elif outcome.get("skipped"):
-                    print(f"  skipped {outcome['skipped']}")
-                else:
-                    print(f"  FAILED {kind}/{path.name}: {outcome.get('error')}")
+            token = resolve_user_token(env, base_url)
+            if not token:
+                print("NOTE: no Supabase credential in .env for attachments; skipping files.")
+            else:
+                for path, kind in collect_artifacts(summary, args.log):
+                    outcome = attach_artifact(token, experiment_id, path, kind, base_url)
+                    if outcome.get("file_name"):
+                        print(f"  attached {kind}/{outcome['file_name']} "
+                              f"({outcome['size_bytes'] / 1024 / 1024:.1f} MB)")
+                    elif outcome.get("skipped"):
+                        print(f"  skipped {outcome['skipped']}")
+                    else:
+                        print(f"  FAILED {kind}/{path.name}: {outcome.get('error')}")
 
     append_results_tsv(sha, metric, peak_vram_gb, status, args.name)
     print(f"Recorded {sha}\t{metric:.6f}\t{peak_vram_gb}\t{status}\t{args.name} in results.tsv")
